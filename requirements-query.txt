@@ -1,0 +1,2 @@
+# Optional dependency for complete validation of .export --query SQL.
+sqlglot>=30.22.0,<31

@@ -1,0 +1,13 @@
+# Database drivers, including MySQL RSA authentication support.
+pymssql>=2.4
+pyodbc
+pymysql[rsa]
+
+# SQL parser for .export --query; keep its version constraints in one place.
+-r requirements-query.txt
+
+# PDF user-guide generation.
+markdown
+
+# Windows readline support for interactive history and completion.
+pyreadline3; sys_platform == "win32"

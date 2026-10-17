@@ -127,7 +127,9 @@ Script files and piped input must be UTF-8 without a byte-order mark, and at mos
 | 1 | A batch failed, the connection failed, or an input or env file couldn't be read |
 | 2 | Invalid command-line usage (argparse error) |
 
-When a batch fails, its error goes to stderr and the remaining batches still run; the exit code is 1 at the end. Writing to a closed pipe (for example `| head`) exits quietly with code 1, after committing any changes that batch already made.
+When a batch fails, its error goes to stderr and the remaining batches still run; the exit code is 1 at the end.
+
+Server messages from `PRINT` and `RAISERROR` with severity 10 or lower (including `WITH NOWAIT` progress messages and `Changed database context to ...`) are printed to stderr as they arrive, so they never mix with CSV or JSON results. Higher severities are errors and are reported as such. Writing to a closed pipe (for example `| head`) exits quietly with code 1, after committing any changes that batch already made.
 
 ## Interactive REPL
 
@@ -296,7 +298,7 @@ A new export is written to a temporary file next to the target and renamed over 
 
 ## Importing data
 
-`.import` bulk-loads a CSV, JSON or JSONL file into an existing table using parameterized, batched `INSERT`s, committing after each batch.
+`.import` bulk-loads a CSV, JSON or JSONL file into an existing table using parameterized, batched `INSERT`s, committing after each batch. On SQL Server each batch is sent as requests of up to 1,000 single-row `INSERT`s (fewer for wide rows or large values), so a request costs one round trip instead of one per row; each row still converts to the column types on its own, exactly as a lone `INSERT` would. On MySQL, pymysql combines the rows of a batch itself.
 
 ```text
 .import users.csv dbo.users
@@ -315,22 +317,25 @@ A new export is written to a temporary file next to the target and renamed over 
 | `--delimiter CHAR` | `,` | CSV field separator |
 | `--columns a,b,...` | From the file | Explicit target column list |
 | `--on-error skip\|abort` | `abort` | What to do when a batch fails |
+| `--keep-identity` | Off | Inserts the file's values into a SQL Server `IDENTITY` column (`SET IDENTITY_INSERT`); without it, a file that includes the identity column is refused before anything is inserted |
 
 ### How columns are matched
 
 - **CSV with a header:** header names are matched to table columns case-insensitively. Duplicate header names are an error. `--columns` picks a subset of the header to load.
 - **CSV without a header (`--no-header`):** fields map in order to the `--columns` list or, without it, to every table column in table order. Each row must have exactly that many fields.
-- **JSON / JSONL:** each record must be an object. Columns come from the keys of the first record imported, or from `--columns`.
+- **JSON / JSONL:** each record must be an object. Columns come from the keys of the first record imported, or from `--columns`. Without `--columns`, the tool warns once if a later record has keys the first one lacks, since those values are not imported.
+- **Generated columns** (SQL Server `rowversion`/`timestamp` and computed columns; MySQL generated columns) are skipped automatically, with a note, because the server computes them; a full-table export therefore re-imports into the same table definition. Naming one in `--columns` sends it anyway.
+- **Identity columns:** add `--keep-identity` to keep the file's values (for example when copying a table), or leave the column out with `--columns` to let SQL Server assign new ones. MySQL accepts explicit `AUTO_INCREMENT` values without the option.
 - An empty, unquoted CSV field becomes NULL. A quoted empty field (`""`) is an empty string for text columns and NULL for any other column type. In a one-column CSV a blank line is a NULL row. Every column you name must exist in the table, or the import stops before inserting anything.
 - An empty JSON array or JSONL file (such as the export of an empty table) imports no rows.
-- For binary columns (`binary`, `varbinary`, `image`, or MySQL blob types), exported `0x...` values are decoded back to bytes, including `0x` for empty bytes. Text columns retain their literal values. Malformed binary hex follows `--on-error abort|skip`.
+- For binary columns (`binary`, `varbinary`, `image`, or MySQL blob types) and SQL Server's `geography`, `geometry` and `hierarchyid` columns, exported `0x...` values are decoded back to bytes, including `0x` for empty bytes. Other values in those columns (such as WKT text like `POINT(1 2)`) are passed through as text. Text columns retain their literal values. Malformed binary hex follows `--on-error abort|skip`.
 
-A JSON array file is read into memory and is limited to 512 MiB; JSONL is streamed line by line, so use JSONL for large imports. A bare table name means `dbo.table` on SQL Server and the current database on MySQL.
+A JSON array file is read into memory and is limited to 512 MiB; JSONL is streamed line by line, so use JSONL for large imports. A single CSV field may hold up to 512 Mi characters. A bare table name means `dbo.table` on SQL Server and the current database on MySQL.
 
 ### Errors
 
 - **`--on-error abort`** (default): the failing batch is rolled back and the import stops. Batches committed earlier stay in the table.
-- **`--on-error skip`:** the failing batch is rolled back and retried one row at a time. Rows that still fail are skipped and reported by row number. Rows that fail validation (wrong field count, a non-object JSON record) are skipped the same way.
+- **`--on-error skip`:** the failing batch is rolled back and retried in halves: a half that inserts cleanly is committed at once, a half that fails is split again, so only the bad rows end up retried on their own. They are skipped and reported by row number, and the other rows keep their order. Rows that fail validation (wrong field count, a non-object JSON record) are skipped the same way.
 - The summary on stderr reports rows imported, elapsed time, rate, and rows skipped.
 - CSV parsing and invalid UTF-8 errors stop the import with a read-error message and close the input. Previously committed batches remain; an explicit transaction remains available for your `COMMIT` or `ROLLBACK`.
 
@@ -433,6 +438,9 @@ With `--mysql`, the tool reads your SQL by MySQL's rules when deciding where sta
 Generated INSERT statements double backslashes and assume the server's default `sql_mode`. If your server enables `NO_BACKSLASH_ESCAPES`, those statements will store doubled backslashes.
 
 ### Limitations
+
+- **`sql_variant` columns with pymssql.** pymssql returns `sql_variant` values as raw bytes without their base type, and some mixes of base types make it drop the connection. Cast such columns to a concrete type in your query (`CAST(col AS nvarchar(4000))`, or `SQL_VARIANT_PROPERTY(col, 'BaseType')` to see the type).
+- **Large insert-mode dumps.** `--mode insert` output has no `GO` lines, so piping it back runs as a single batch: raise `--query-timeout` for big dumps, and keep each script under the 64 MiB input limit.
 
 - **No `DELIMITER` command.** At the prompt, a `CREATE PROCEDURE` or trigger body containing `;` runs as soon as a line ends with `;`, on either server. Put such definitions in a file and run it with `-f` or `.read`; the whole file between `GO` lines is sent as one batch.
 - **MySQL query timeouts drop the connection.** `--query-timeout` is pymysql's socket read timeout, so a query that runs too long closes the connection. The server would otherwise keep running the statement (and, under autocommit, commit it), so the tool opens a second connection and sends `KILL QUERY` to stop it; if that fails it warns that the statement may still complete. Run `.reconnect` afterwards, and raise `--query-timeout` for long jobs.
