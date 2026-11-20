@@ -1,6 +1,8 @@
 import importlib.util
 import csv
 import datetime
+import decimal
+import base64
 import io
 import json
 import os
@@ -638,6 +640,119 @@ class MssqlRegressionTests(unittest.TestCase):
 
         self.assertEqual(conn.commit_count, 1)
         self.assertEqual(conn.rollback_count, 0)
+
+    def test_execute_sql_commits_owned_batch_whose_dml_results_are_hidden_by_select(self):
+        # pymssql surfaces only the SELECT's result set for "DECLARE ...; INSERT ...; SELECT",
+        # so nothing looks like a data change; the batch must still commit
+        # before _mssql_owned_work restores autocommit (which rolls back).
+        conn = PymssqlTransactionConn()
+        ctx = {"conn": conn, "output": io.StringIO(), "driver_name": "pymssql"}
+
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertTrue(MSSQL.execute_sql("DECLARE @v int = 7; INSERT INTO t VALUES (7); SELECT id FROM t", ctx))
+
+        self.assertEqual(conn.durable, [7])
+        self.assertEqual(conn.depth, 0)
+        self.assertTrue(conn.autocommit_state)
+        self.assertIn("7", ctx["output"].getvalue())
+
+    def test_execute_sql_owned_batch_skips_redundant_rollback_after_commit(self):
+        # After commit() nothing is pending; autocommit(True) ends pymssql's
+        # empty follow-on transaction itself, so a rollback() would only add
+        # two round trips (ROLLBACK TRAN + BEGIN TRAN) to every batch.
+        for sql, durable in (("SELECT id FROM t", [1]),
+                             ("DECLARE @v int = 7; INSERT INTO t VALUES (7); SELECT id FROM t", [1, 7])):
+            with self.subTest(sql=sql):
+                conn = PymssqlTransactionConn()
+                conn.durable = [1]
+                ctx = {"conn": conn, "output": io.StringIO(), "driver_name": "pymssql"}
+
+                with mock.patch("sys.stderr", new=io.StringIO()):
+                    self.assertTrue(MSSQL.execute_sql(sql, ctx))
+
+                self.assertEqual(conn.commit_count, 1)
+                self.assertEqual(conn.rollback_count, 0)
+                self.assertEqual(conn.autocommit_calls, [False, True])
+                self.assertEqual(conn.durable, durable)
+                self.assertEqual(conn.depth, 0)
+                self.assertTrue(conn.autocommit_state)
+                self.assertNotIn("_owned_work_committed", ctx)
+
+    def test_execute_sql_owned_batch_failed_commit_still_discards_work(self):
+        class CommitFailsConn(PymssqlTransactionConn):
+            def commit(self):
+                self.commit_count += 1
+                raise self.error_type("Cannot commit transaction")
+
+        conn = CommitFailsConn()
+        ctx = {"conn": conn, "output": io.StringIO(), "driver_name": "pymssql"}
+
+        with mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            self.assertFalse(MSSQL.execute_sql("DECLARE @v int = 7; INSERT INTO t VALUES (7); SELECT id FROM t", ctx))
+
+        self.assertEqual(conn.commit_count, 1)
+        self.assertGreaterEqual(conn.rollback_count, 1)
+        self.assertEqual(conn.durable, [])
+        self.assertEqual(conn.depth, 0)
+        self.assertTrue(conn.autocommit_state)
+        self.assertIn("Cannot commit transaction", stderr.getvalue())
+
+    def test_mssql_owned_work_ignores_stale_commit_flag(self):
+        # A commit recorded by an earlier batch (e.g. one run outside owned
+        # work) must not make this batch skip discarding its pending work.
+        conn = PymssqlTransactionConn()
+        ctx = {"conn": conn, "driver_name": "pymssql", "_owned_work_committed": True}
+
+        def uncommitted_insert():
+            conn.cursor().execute("INSERT INTO t VALUES (9)")
+            return True
+
+        self.assertTrue(MSSQL._mssql_owned_work(ctx, uncommitted_insert))
+
+        self.assertEqual(conn.durable, [])
+        self.assertEqual(conn.rollback_count, 1)
+        self.assertTrue(conn.autocommit_state)
+        self.assertNotIn("_owned_work_committed", ctx)
+
+    def test_execute_sql_owned_batch_failing_after_hidden_dml_keeps_nothing(self):
+        # Failure-path counterpart of the test above: the commit must only
+        # happen on success, so an error after hidden DML leaves nothing.
+        conn = PymssqlTransactionConn()
+        ctx = {"conn": conn, "output": io.StringIO(), "driver_name": "pymssql"}
+
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            self.assertFalse(MSSQL.execute_sql("DECLARE @v int = 7; INSERT INTO t VALUES (7); FAIL", ctx))
+
+        self.assertEqual(conn.durable, [])
+        self.assertEqual(conn.commit_count, 0)
+        self.assertEqual(conn.depth, 0)
+        self.assertTrue(conn.autocommit_state)
+
+    def test_execute_sql_never_commits_in_implicit_transaction_mode(self):
+        # With SET IMPLICIT_TRANSACTIONS ON the user commits (as in sqlcmd);
+        # the tool must not, whether or not the batch returns rows.
+        for states in ([{"description": None, "rowcount": 1}],
+                       [{"description": [("id",)], "rows": [(1,)], "rowcount": 1}]):
+            with self.subTest(returns_rows=bool(states[0]["description"])):
+                conn = FakeConn(FakeCursor(states))
+                ctx = {"conn": conn, "output": io.StringIO(), "driver_name": "pymssql",
+                       "implicit_transactions": True}
+                with mock.patch("sys.stderr", new=io.StringIO()):
+                    self.assertTrue(MSSQL._execute_sql("INSERT INTO t VALUES (1); SELECT id FROM t", ctx))
+                self.assertEqual(conn.commit_count, 0)
+                self.assertEqual(conn.rollback_count, 0)
+
+    def test_execute_sql_select_only_owned_batch_leaves_data_unchanged(self):
+        conn = PymssqlTransactionConn()
+        conn.durable = [1, 2]
+        ctx = {"conn": conn, "output": io.StringIO(), "driver_name": "pymssql"}
+
+        self.assertTrue(MSSQL.execute_sql("SELECT id FROM t", ctx))
+
+        self.assertEqual(conn.durable, [1, 2])
+        self.assertEqual(conn.depth, 0)
+        self.assertTrue(conn.autocommit_state)
+        self.assertEqual(ctx["transaction_depth"], 0)
 
     def test_execute_sql_commits_cte_data_change_statement_that_returns_rows(self):
         cursor = FakeCursor(
@@ -2378,6 +2493,58 @@ class MssqlRegressionTests(unittest.TestCase):
             csv_path.write_text("id,name\n0,Bob\n", encoding="utf-8")
             MSSQL.export_data(f"dbo.users {quote_dot_arg(csv_path)} --append --format csv", ctx)
             self.assertEqual(csv_path.read_text(encoding="utf-8"), "id,name\n0,Bob\n1,Alice\n")
+
+    def test_export_append_restores_original_bytes_after_final_flush_error(self):
+        class FailingRawFile(io.FileIO):
+            def write(self, data):
+                super().write(data[:max(1, len(data) // 2)])
+                raise OSError("disk full during final flush")
+
+        class ExportCursor(FakeCursor):
+            def __init__(self):
+                super().__init__([{"description": [("name",)]}])
+                self.chunks = [[("new row",)]]
+
+            def fetchmany(self, size):
+                return self.chunks.pop(0) if self.chunks else []
+
+        real_open = open
+        for fmt in ("csv", "jsonl"):
+            for restore_fails in (False, True):
+                with self.subTest(fmt=fmt, restore_fails=restore_fails), \
+                     tempfile.TemporaryDirectory() as tmpdir:
+                    path = Path(tmpdir) / ("rows." + fmt)
+                    original = ("name\r\né雪\r\n" if fmt == "csv" else
+                                '{"name":"é雪"}\n').encode("utf-8")
+                    path.write_bytes(original)
+                    writers = []
+
+                    def open_export(file, mode="r", **kwargs):
+                        if file == str(path) and mode == "a":
+                            writer = io.TextIOWrapper(
+                                io.BufferedWriter(FailingRawFile(file, "ab")),
+                                **kwargs,
+                            )
+                            writers.append(writer)
+                            return writer
+                        return real_open(file, mode, **kwargs)
+
+                    cursor = ExportCursor()
+                    truncate = OSError("cannot restore file") if restore_fails else os.truncate
+                    with mock.patch("builtins.open", side_effect=open_export), \
+                         mock.patch.object(MSSQL.os, "truncate", side_effect=truncate), \
+                         mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                        MSSQL.export_data(f"t {quote_dot_arg(path)} --append",
+                                          {"conn": FakeConn(cursor)})
+
+                    self.assertTrue(all(writer.closed for writer in writers))
+                    self.assertEqual(cursor.close_count, 1)
+                    self.assertIn("Export error closing", stderr.getvalue())
+                    self.assertNotIn("Exported", stderr.getvalue())
+                    if restore_fails:
+                        self.assertIn("cannot restore file", stderr.getvalue())
+                    else:
+                        self.assertEqual(path.read_bytes(), original)
 
     def test_format_csv_preserves_trailing_spaces_in_last_field(self):
         self.assertEqual(MSSQL.format_csv([("Alice ",)], ["name"]), "name\r\nAlice ")
@@ -4770,6 +4937,25 @@ class MssqlRegressionTests(unittest.TestCase):
         self.assertIn("sent KILL QUERY", stderr.getvalue())
         self.assertIn("Reconnect before issuing more SQL", stderr.getvalue())
 
+    def test_mysql_kill_side_connection_failure_reports_reason(self):
+        # The side connection re-resolves credentials; if that fails (here the
+        # password file is gone) the operator must learn why the runaway
+        # statement could not be cancelled.
+        conn = self._lost_connection_conn()
+        ctx = {"conn": conn, "output": io.StringIO(), "dialect": "mysql",
+               "conn_args": self._mysql_args(user="app", password_file="/nonexistent/pw.txt")}
+
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(MSSQL.pymysql, "connect") as connect, \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            ok = MSSQL.execute_sql("UPDATE big SET x = 1", ctx)
+
+        self.assertFalse(ok)
+        connect.assert_not_called()
+        self.assertIn("Cannot open a connection to cancel the query: --password-file: "
+                      "cannot read password file '/nonexistent/pw.txt'", stderr.getvalue())
+        self.assertIn("may still be running", stderr.getvalue())
+
     def test_execute_sql_mysql_lost_connection_warns_when_kill_fails(self):
         conn = self._lost_connection_conn()
         ctx = {"conn": conn, "output": io.StringIO(), "dialect": "mysql",
@@ -5493,6 +5679,460 @@ class MssqlRegressionTests(unittest.TestCase):
                         MSSQL._connect(args)
                     self.assertEqual(connect.call_args.kwargs["password"], expected.encode("utf-8") if mysql else expected)
 
+    def test_decode_password_handles_b64_prefix(self):
+        for value, expected in (
+            ("plain", "plain"),
+            ("", ""),
+            ("%%b64%%VGhpc0lzTXlQYXNzd29yZAo=", "ThisIsMyPassword"),   # echo adds \n
+            ("%%b64%%cHc=", "pw"),
+            ("%%b64%%cHcNCg==", "pw"),                                 # trailing \r\n
+            ("%%b64%%cHcKCg==", "pw\n"),                               # only one newline dropped
+            ("%%b64%%w6lww6k=", "épé"),
+            ("%%b64%%", ""),
+            ("%%b64%%cHcK=", "pw"),                                    # stray "=" after a complete value
+            ("%%b64%%cHcK==", "pw"),
+            ("%%b64%%cHc", "pw"),                                      # padding omitted
+            ("%%b64%%cHc===", "pw"),                                   # too much padding
+            ("%%b64%%" + base64.b64encode(b"Abc#123456789xyz!@\n").decode() + "=", "Abc#123456789xyz!@"),
+            ("x%%b64%%cHc=", "x%%b64%%cHc="),                          # prefix must lead
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(MSSQL._decode_password(value, "SRC"), expected)
+
+    def test_decode_password_rejects_bad_b64_without_echoing_value(self):
+        for value, reason in (
+            ("%%b64%%secret!!", "Only base64 data is allowed"),     # bad character
+            ("%%b64%%c2Vj cmV0", "Only base64 data is allowed"),    # embedded space
+            ("%%b64%%c2VjcmV0c", "number of data characters (9)"),  # impossible length
+            ("%%b64%%/w==", "does not decode to UTF-8"),            # not UTF-8
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError) as exc:
+                    MSSQL._decode_password(value, "MYSQL_PASSWORD")
+                self.assertIn("MYSQL_PASSWORD", str(exc.exception))
+                self.assertIn(reason, str(exc.exception))
+                self.assertNotIn(value[len("%%b64%%"):], str(exc.exception))
+
+    def test_b64_password_decoded_from_flag_env_file_and_environment(self):
+        encoded = "%%b64%%" + base64.b64encode(b"s3cret\n").decode()
+        for mysql, module, prefix in ((False, MSSQL.pymssql, "MSSQL"), (True, MSSQL.pymysql, "MYSQL")):
+            for source in ("flag", "file", "env"):
+                with self.subTest(mysql=mysql, source=source):
+                    args = self._mysql_args(
+                        user="app", mysql=mysql,
+                        password=encoded if source == "flag" else None,
+                        env_file_values={f"{prefix}_PASSWORD": encoded} if source == "file" else {},
+                    )
+                    env = {f"{prefix}_PASSWORD": encoded} if source == "env" else {}
+                    with mock.patch.dict(os.environ, env, clear=True), \
+                         mock.patch.object(module, "connect") as connect:
+                        MSSQL._connect(args)
+                    self.assertEqual(connect.call_args.kwargs["password"], b"s3cret" if mysql else "s3cret")
+
+    # ── %%fernet%% passwords ──────────────────────────────────────────────
+
+    def _fernet(self):
+        from cryptography.fernet import Fernet
+        key = Fernet.generate_key()
+        return key, Fernet(key)
+
+    def _key_file(self, tmpdir, key, mode=0o600, name="pw.key"):
+        path = Path(tmpdir) / name
+        path.write_bytes(key + b"\n")
+        path.chmod(mode)
+        return str(path)
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_password_decrypted_with_key_from_each_source(self):
+        key, fernet = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt("p#ss$word\n".encode()).decode()
+        for mysql, module, prefix in ((False, MSSQL.pymssql, "MSSQL"), (True, MSSQL.pymysql, "MYSQL")):
+            for key_source in ("flag", "file_setting_in_env_file", "generic_in_env_file", "env_key", "env_key_file"):
+                with self.subTest(mysql=mysql, key_source=key_source), tempfile.TemporaryDirectory() as tmpdir:
+                    key_path = self._key_file(tmpdir, key)
+                    file_values = {f"{prefix}_PASSWORD": token}
+                    env = {}
+                    fernet_key_file = ""
+                    if key_source == "flag":
+                        fernet_key_file = key_path
+                    elif key_source == "file_setting_in_env_file":
+                        file_values[f"{prefix}_FERNET_KEY_FILE"] = key_path
+                    elif key_source == "generic_in_env_file":
+                        file_values.update(MSSQL._resolve_env_file_values({"DB_FERNET_KEY": key.decode()}, prefix))
+                    elif key_source == "env_key":
+                        env[f"{prefix}_FERNET_KEY"] = key.decode()
+                    else:
+                        env[f"{prefix}_FERNET_KEY_FILE"] = key_path
+                    args = self._mysql_args(user="app", mysql=mysql, env_file_values=file_values,
+                                            fernet_key_file=fernet_key_file)
+                    with mock.patch.dict(os.environ, env, clear=True), \
+                         mock.patch.object(module, "connect") as connect:
+                        MSSQL._connect(args)
+                    self.assertEqual(connect.call_args.kwargs["password"],
+                                     b"p#ss$word" if mysql else "p#ss$word")
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_key_precedence_is_flag_then_key_file_then_inline_key(self):
+        key, fernet = self._fernet()
+        wrong, _ = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            good_path = self._key_file(tmpdir, key, name="good.key")
+            wrong_path = self._key_file(tmpdir, wrong, name="wrong.key")
+            for flag, file_setting, inline in ((good_path, wrong_path, wrong.decode()),
+                                               ("", good_path, wrong.decode())):
+                with self.subTest(flag=bool(flag)):
+                    args = self._mysql_args(user="app", mysql=False, fernet_key_file=flag, password=token,
+                                            env_file_values={"MSSQL_FERNET_KEY_FILE": file_setting})
+                    with mock.patch.dict(os.environ, {"MSSQL_FERNET_KEY": inline}, clear=True), \
+                         mock.patch.object(MSSQL.pymssql, "connect") as connect:
+                        MSSQL._connect(args)
+                    self.assertEqual(connect.call_args.kwargs["password"], "pw")
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_env_file_key_beats_any_exported_key(self):
+        # Regression: an exported MSSQL_FERNET_KEY_FILE used to beat an inline
+        # DB_FERNET_KEY in the --env-file, decrypting with the wrong key.
+        key, fernet = self._fernet()
+        wrong, _ = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            good_path = self._key_file(tmpdir, key, name="good.key")
+            wrong_path = self._key_file(tmpdir, wrong, name="wrong.key")
+            cases = (
+                # (env-file generic values, process environment)
+                ({"DB_FERNET_KEY": key.decode()}, {"MSSQL_FERNET_KEY_FILE": wrong_path}),
+                ({"DB_FERNET_KEY": key.decode()}, {"MSSQL_FERNET_KEY": wrong.decode()}),
+                ({"DB_FERNET_KEY_FILE": good_path}, {"MSSQL_FERNET_KEY_FILE": wrong_path}),
+                ({"DB_FERNET_KEY_FILE": good_path, "DB_FERNET_KEY": wrong.decode()}, {}),
+                ({}, {"MSSQL_FERNET_KEY_FILE": good_path, "MSSQL_FERNET_KEY": wrong.decode()}),
+            )
+            for file_values, env in cases:
+                with self.subTest(file=sorted(file_values), env=sorted(env)):
+                    args = self._mysql_args(
+                        user="app", mysql=False, password=token,
+                        env_file_values=MSSQL._resolve_env_file_values({**file_values}, "MSSQL"),
+                    )
+                    with mock.patch.dict(os.environ, env, clear=True), \
+                         mock.patch.object(MSSQL.pymssql, "connect") as connect:
+                        MSSQL._connect(args)
+                    self.assertEqual(connect.call_args.kwargs["password"], "pw")
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_wrong_key_error_names_env_file_or_environment_source(self):
+        _, fernet = self._fernet()
+        wrong, _ = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        for file_values, env, source in (
+            ({"MSSQL_FERNET_KEY": wrong.decode()}, {}, "key from --env-file MSSQL_FERNET_KEY"),
+            ({}, {"MSSQL_FERNET_KEY": wrong.decode()}, "key from MSSQL_FERNET_KEY"),
+        ):
+            with self.subTest(source=source):
+                loader = MSSQL._fernet_key_loader(self._mysql_args(env_file_values=file_values), "MSSQL")
+                with mock.patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError) as exc:
+                    MSSQL._decode_password(token, "MSSQL_PASSWORD", loader)
+                self.assertIn(source + " (wrong key", str(exc.exception))
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_errors_never_reveal_password_token_or_key(self):
+        key, fernet = self._fernet()
+        wrong, _ = self._fernet()
+        token = fernet.encrypt(b"s3cret-pw").decode()
+        loader = lambda k: (lambda: (k, "MSSQL_FERNET_KEY"))
+        cases = (
+            ("%%fernet%%" + token, loader(wrong), "wrong key, or a damaged token"),
+            ("%%fernet%%" + token[:-6] + "AAAAAA", loader(key), "wrong key, or a damaged token"),
+            ("%%fernet%%not-a-token", loader(key), "wrong key, or a damaged token"),
+            ("%%fernet%%" + token, loader(b"short-key"), "not a valid Fernet key"),
+            ("%%fernet%%" + fernet.encrypt(b"\xff").decode(), loader(key), "does not decrypt to UTF-8"),
+            ("%%fernet%%" + token, None, "no Fernet key"),
+        )
+        for value, key_loader, reason in cases:
+            with self.subTest(reason=reason):
+                with self.assertRaises(ValueError) as exc:
+                    MSSQL._decode_password(value, "MSSQL_PASSWORD", key_loader)
+                message = str(exc.exception)
+                self.assertIn(reason, message)
+                for secret in ("s3cret-pw", token, key.decode(), wrong.decode()):
+                    self.assertNotIn(secret, message)
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_missing_or_unreadable_key_reports_where_to_set_it(self):
+        _, fernet = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        args = self._mysql_args(user="app", mysql=True, password=token, env_file_values={})
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(ValueError) as exc:
+                MSSQL._connect(args)
+        self.assertIn("--fernet-key-file, MYSQL_FERNET_KEY_FILE, or MYSQL_FERNET_KEY", str(exc.exception))
+        args.fernet_key_file = "/nonexistent/pw.key"
+        with self.assertRaises(ValueError) as exc:
+            MSSQL._connect(args)
+        self.assertIn("cannot read Fernet key file", str(exc.exception))
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_fernet_key_file_readable_by_others_warns(self):
+        key, fernet = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        for mode, warns in ((0o600, False), (0o644, True)):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as tmpdir:
+                path = self._key_file(tmpdir, key, mode=mode)
+                with mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                    loader = MSSQL._fernet_key_loader(self._mysql_args(fernet_key_file=path), "MSSQL")
+                    self.assertEqual(MSSQL._decode_password(token, "--password", loader), "pw")
+                self.assertEqual("readable by other users" in stderr.getvalue(), warns and os.name == "posix")
+
+    def test_env_file_relative_key_file_path_is_relative_to_env_file(self):
+        values = {"DB_FERNET_KEY_FILE": "keys/pw.key", "MYSQL_FERNET_KEY_FILE": "my.key"}
+        self.assertEqual(
+            MSSQL._resolve_env_file_values(values, "MSSQL", base_dir="/etc/app")["MSSQL_FERNET_KEY_FILE"],
+            str(Path("/etc/app") / "keys/pw.key"),
+        )
+        self.assertEqual(
+            MSSQL._resolve_env_file_values(values, "MYSQL", base_dir="/etc/app")["MYSQL_FERNET_KEY_FILE"],
+            str(Path("/etc/app") / "my.key"),
+        )
+        for kept in ("/abs/pw.key", "~/pw.key"):
+            with self.subTest(path=kept):
+                self.assertEqual(
+                    MSSQL._resolve_env_file_values({"DB_FERNET_KEY_FILE": kept}, "MSSQL", base_dir="/etc/app"),
+                    {"MSSQL_FERNET_KEY_FILE": kept},
+                )
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_main_env_file_fernet_password_with_key_beside_it_from_another_directory(self):
+        key, fernet = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        cursor = FakeCursor([{"description": None, "rowcount": 0}])
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.TemporaryDirectory() as elsewhere:
+            self._key_file(tmpdir, key, name="db.key")
+            path = self._write_env_file(tmpdir, f"DB_USER=sa\nDB_PASSWORD={token}\nDB_FERNET_KEY_FILE=db.key\n")
+            argv = ["mssql.py", "--env-file", str(path), "-c", "SELECT 1"]
+            cwd = os.getcwd()
+            try:
+                os.chdir(elsewhere)
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(MSSQL.pymssql, "connect", return_value=FakeConn(cursor)) as connect, \
+                     mock.patch("sys.argv", argv), mock.patch("sys.stdout", new=io.StringIO()):
+                    MSSQL.main()
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(connect.call_args.kwargs["password"], "pw")
+
+    def _password_file(self, tmpdir, data, mode=0o600, name="pw.txt"):
+        path = Path(tmpdir) / name
+        path.write_bytes(data if isinstance(data, bytes) else data.encode("utf-8"))
+        path.chmod(mode)
+        return str(path)
+
+    def test_password_file_supplies_plain_and_b64_passwords(self):
+        for content, expected in (
+            ("p#ss$word\n", "p#ss$word"),            # echo-style newline dropped
+            ("p#ss$word", "p#ss$word"),
+            ("p#ss$word\r\n", "p#ss$word"),
+            ("  spaced pw  \n", "  spaced pw  "),      # other whitespace kept
+            ("pw\n\n", "pw\n"),                      # only one newline dropped
+            ("\ufeffpw\n", "pw"),                     # UTF-8 BOM dropped
+            ("%%b64%%cHcK=\n", "pw"),
+        ):
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as tmpdir:
+                args = self._mysql_args(user="app", mysql=False,
+                                        password_file=self._password_file(tmpdir, content))
+                with mock.patch.dict(os.environ, {"MSSQL_PASSWORD": "env-pw"}, clear=True), \
+                     mock.patch.object(MSSQL.pymssql, "connect") as connect:
+                    MSSQL._connect(args)
+                self.assertEqual(connect.call_args.kwargs["password"], expected)
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_password_file_with_fernet_token_beats_env_file_and_environment(self):
+        key, fernet = self._fernet()
+        for mysql, module, prefix in ((False, MSSQL.pymssql, "MSSQL"), (True, MSSQL.pymysql, "MYSQL")):
+            with self.subTest(mysql=mysql), tempfile.TemporaryDirectory() as tmpdir:
+                token = "%%fernet%%" + fernet.encrypt(b"file-pw").decode() + "\n"
+                args = self._mysql_args(
+                    user="app", mysql=mysql,
+                    password_file=self._password_file(tmpdir, token),
+                    fernet_key_file=self._key_file(tmpdir, key),
+                    env_file_values={f"{prefix}_PASSWORD": "envfile-pw"},
+                )
+                with mock.patch.dict(os.environ, {f"{prefix}_PASSWORD": "env-pw"}, clear=True), \
+                     mock.patch.object(module, "connect") as connect:
+                    MSSQL._connect(args)
+                self.assertEqual(connect.call_args.kwargs["password"], b"file-pw" if mysql else "file-pw")
+
+    def test_password_file_errors_never_reveal_contents(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cases = (
+                (str(Path(tmpdir) / "missing.txt"), "cannot read password file"),
+                (self._password_file(tmpdir, b"s3cret\xff\n", name="latin.txt"), "is not UTF-8 text"),
+                (self._password_file(tmpdir, b"s3cret" * 20000, name="big.txt"), "larger than 65536 bytes"),
+                (self._password_file(tmpdir, "%%b64%%s3cret!!\n", name="bad.txt"), "--password-file: invalid %%b64%%"),
+            )
+            for path, reason in cases:
+                with self.subTest(reason=reason):
+                    args = self._mysql_args(user="app", mysql=False, password_file=path)
+                    with mock.patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError) as exc:
+                        MSSQL._connect(args)
+                    self.assertIn(reason, str(exc.exception))
+                    self.assertNotIn("s3cret", str(exc.exception))
+
+    @unittest.skipUnless(os.path.isdir("/dev/fd"), "needs /dev/fd (process substitution paths)")
+    def test_password_file_from_pipe_survives_reconnect(self):
+        # --password-file <(cmd) gives a /dev/fd/N pipe that can be read only
+        # once; .reconnect used to get an empty password and fail to log in.
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, b"pipe-pw\n")
+        os.close(write_fd)
+        args = self._mysql_args(user="app", mysql=False, password_file=f"/dev/fd/{read_fd}")
+        try:
+            with mock.patch.dict(MSSQL._ONE_SHOT_SECRET_CACHE, clear=True), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(MSSQL.pymssql, "connect") as connect, \
+                 mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                MSSQL._connect(args)   # startup
+                MSSQL._connect(args)   # .reconnect
+                MSSQL._connect(args)   # e.g. MySQL KILL QUERY side connection
+        finally:
+            os.close(read_fd)
+        self.assertEqual([c.kwargs["password"] for c in connect.call_args_list], ["pipe-pw"] * 3)
+        self.assertNotIn("by other users", stderr.getvalue())  # pipe modes aren't meaningful
+
+    @unittest.skipUnless(os.path.isdir("/dev/fd") and importlib.util.find_spec("cryptography"),
+                         "needs /dev/fd and cryptography")
+    def test_fernet_key_file_from_pipe_survives_reconnect(self):
+        key, fernet = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"pw").decode()
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, key + b"\n")
+        os.close(write_fd)
+        args = self._mysql_args(user="app", mysql=False, password=token, fernet_key_file=f"/dev/fd/{read_fd}")
+        try:
+            with mock.patch.dict(MSSQL._ONE_SHOT_SECRET_CACHE, clear=True), \
+                 mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(MSSQL.pymssql, "connect") as connect:
+                MSSQL._connect(args)
+                MSSQL._connect(args)
+        finally:
+            os.close(read_fd)
+        self.assertEqual([c.kwargs["password"] for c in connect.call_args_list], ["pw", "pw"])
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "needs named pipes")
+    def test_password_file_named_pipe_is_not_permission_warned_and_is_cached(self):
+        # A FIFO's (or terminal's) mode says nothing about the secret at rest,
+        # so no chmod warning even when it is world-readable.
+        import threading
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.dict(MSSQL._ONE_SHOT_SECRET_CACHE, clear=True):
+            path = os.path.join(tmpdir, "pw.fifo")
+            os.mkfifo(path, 0o644)
+            os.chmod(path, 0o644)
+            writer = threading.Thread(target=lambda: Path(path).write_bytes(b"fifo-pw\n"))
+            writer.start()
+            args = self._mysql_args(user="app", mysql=False, password_file=path)
+            try:
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(MSSQL.pymssql, "connect") as connect, \
+                     mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                    MSSQL._connect(args)
+                    MSSQL._connect(args)   # would block forever without the cache
+            finally:
+                writer.join(timeout=5)
+        self.assertEqual([c.kwargs["password"] for c in connect.call_args_list], ["fifo-pw"] * 2)
+        self.assertNotIn("by other users", stderr.getvalue())
+
+    def test_password_file_regular_file_is_reread_so_rotation_is_picked_up(self):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+             mock.patch.dict(MSSQL._ONE_SHOT_SECRET_CACHE, clear=True):
+            path = self._password_file(tmpdir, "old-pw\n")
+            args = self._mysql_args(user="app", mysql=False, password_file=path)
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(MSSQL.pymssql, "connect") as connect:
+                MSSQL._connect(args)
+                Path(path).write_text("new-pw\n", encoding="utf-8")
+                MSSQL._connect(args)
+            self.assertEqual(MSSQL._ONE_SHOT_SECRET_CACHE, {})
+        self.assertEqual([c.kwargs["password"] for c in connect.call_args_list], ["old-pw", "new-pw"])
+
+    def test_empty_password_or_key_file_is_rejected_before_connecting(self):
+        for content in ("", "\n", "  \r\n"):
+            for which in ("password", "key"):
+                with self.subTest(content=content, which=which), tempfile.TemporaryDirectory() as tmpdir:
+                    path = self._password_file(tmpdir, content)
+                    if which == "password":
+                        args = self._mysql_args(user="app", mysql=True, password_file=path)
+                        expected = f"--password-file: password file '{path}' is empty"
+                    else:
+                        args = self._mysql_args(user="app", mysql=True, password="%%fernet%%gAAAA",
+                                                fernet_key_file=path)
+                        expected = f"--fernet-key-file: Fernet key file '{path}' is empty"
+                    if which == "key" and not importlib.util.find_spec("cryptography"):
+                        continue
+                    with mock.patch.dict(os.environ, {}, clear=True), \
+                         mock.patch.object(MSSQL.pymysql, "connect") as connect, \
+                         self.assertRaises(ValueError) as exc:
+                        MSSQL._connect(args)
+                    connect.assert_not_called()
+                    self.assertEqual(str(exc.exception), expected)
+
+    def test_password_file_readable_by_others_warns(self):
+        for mode, expected in ((0o600, None), (0o640, "readable"), (0o604, "readable"),
+                               (0o620, "writable"), (0o602, "writable"), (0o610, "accessible")):
+            with self.subTest(mode=oct(mode)), tempfile.TemporaryDirectory() as tmpdir:
+                args = self._mysql_args(user="app", mysql=False,
+                                        password_file=self._password_file(tmpdir, "pw\n", mode=mode))
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                     mock.patch.object(MSSQL.pymssql, "connect"), \
+                     mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                    MSSQL._connect(args)
+                if expected is None or os.name != "posix":
+                    self.assertNotIn("by other users", stderr.getvalue())
+                else:
+                    self.assertIn(f"password file '{args.password_file}' is {expected} by other users",
+                                  stderr.getvalue())
+
+    def test_main_rejects_password_file_with_password_or_trusted_connection(self):
+        for extra, message in ((["-W", "pw"], "mutually exclusive"),
+                               (["-E"], "--trusted-connection cannot be combined")):
+            with self.subTest(extra=extra):
+                argv = ["mssql.py", "--password-file", "/x/pw.txt", *extra]
+                with mock.patch.object(MSSQL, "build_connection") as connect, \
+                     mock.patch("sys.argv", argv), \
+                     mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                    with self.assertRaises(SystemExit) as exc:
+                        MSSQL.main()
+                self.assertEqual(exc.exception.code, 2)
+                connect.assert_not_called()
+                self.assertIn(message, stderr.getvalue())
+
+    def test_fernet_without_cryptography_installed_gives_install_hint(self):
+        loader = mock.Mock()
+        with mock.patch.dict(sys.modules, {"cryptography": None, "cryptography.fernet": None}):
+            with self.assertRaises(ValueError) as exc:
+                MSSQL._decode_password("%%fernet%%gAAAA", "--password", loader)
+        self.assertIn("pip install cryptography", str(exc.exception))
+        loader.assert_not_called()
+
+    def test_plain_and_b64_passwords_never_load_fernet_key(self):
+        loader = mock.Mock(side_effect=AssertionError("key loaded"))
+        self.assertEqual(MSSQL._decode_password("plain", "X", loader), "plain")
+        self.assertEqual(MSSQL._decode_password("%%b64%%cHc=", "X", loader), "pw")
+
+    def test_main_reports_invalid_b64_password_before_connecting(self):
+        argv = ["mssql.py", "-U", "app", "-W", "%%b64%%not*base64", "-c", "SELECT 1"]
+        # Fail fast if decoding regresses: a plain Mock connection would make
+        # main() loop forever on the fake cursor's always-truthy nextset().
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(MSSQL.pymssql, "connect",
+                               side_effect=AssertionError("connected despite invalid password")) as connect, \
+             mock.patch("sys.argv", argv), \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            with self.assertRaises(SystemExit) as exc:
+                MSSQL.main()
+        self.assertEqual(exc.exception.code, 1)
+        connect.assert_not_called()
+        self.assertIn("--password: invalid %%b64%% base64 password", stderr.getvalue())
+        self.assertNotIn("not*base64", stderr.getvalue())
+
     def test_main_empty_password_and_reconnect_override_environment(self):
         for mysql, module, prefix in ((False, MSSQL.pymssql, "MSSQL"), (True, MSSQL.pymysql, "MYSQL")):
             with self.subTest(mysql=mysql):
@@ -6039,6 +6679,42 @@ class MssqlRegressionTests(unittest.TestCase):
                 self.assertIn("Done. 0 rows", stderr)
                 self.assertNotIn("Error", stderr)
 
+    def test_import_jsonl_null_first_record_preserves_truncate_target(self):
+        for prefix, options in (("", ""), ('{"id":0}\n', "--skip 1")):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as tmpdir:
+                path = Path(tmpdir) / "rows.jsonl"
+                path.write_text(prefix + 'null\n{"id":1}\n', encoding="utf-8")
+                ctx = self._transaction_ctx()
+                conn = ctx["conn"]
+                conn.durable = [99]
+                with mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+                    MSSQL.import_data(f"{quote_dot_arg(path)} t --truncate {options}", ctx)
+                self.assertEqual(conn.durable, [99])
+                self.assertFalse(any(sql.startswith(("TRUNCATE", "INSERT"))
+                                     for sql, _ in conn.executed))
+                self.assertIn("JSONL elements must be JSON objects", stderr.getvalue())
+                self.assertNotIn("Done.", stderr.getvalue())
+
+    def test_import_json_numbers_preserve_decimal_precision(self):
+        records = [
+            '{"amount":9007199254740993.1,"id":1,"flag":true,"note":null}',
+            '{"amount":0.1234567890123456789012345678,"id":2,"flag":false,"note":null}',
+            '{"amount":1.234567890123456789e-20,"id":3,"flag":true,"note":null}',
+        ]
+        expected = [
+            (decimal.Decimal("9007199254740993.1"), 1, True, None),
+            (decimal.Decimal("0.1234567890123456789012345678"), 2, False, None),
+            (decimal.Decimal("1.234567890123456789e-20"), 3, True, None),
+        ]
+        columns = [("amount", "decimal"), ("id", "int"), ("flag", "bit"), ("note", "varchar")]
+        for fmt in ("json", "jsonl"):
+            with self.subTest(fmt=fmt):
+                text = "[" + ",".join(records) + "]" if fmt == "json" else "\n".join(records)
+                _, inserted, stderr = self._import_rows(text, columns, suffix=fmt)
+                self.assertEqual(inserted, [expected])
+                self.assertTrue(all(isinstance(row[0], decimal.Decimal) for row in inserted[0]))
+                self.assertIn("Done. 3 rows", stderr)
+
     def test_export_csv_distinguishes_empty_string_from_null(self):
         class ExportCursor(FakeCursor):
             def __init__(self, description, rows):
@@ -6084,6 +6760,29 @@ class MssqlRegressionTests(unittest.TestCase):
             expected = list(csv.reader(io.StringIO(text, newline=""), delimiter=delimiter))
             got = list(MSSQL._iter_csv_records(io.StringIO(text, newline=""), delimiter))
             self.assertEqual([[v or "" for v in row] for row in got], expected, repr(text))
+
+    def test_iter_csv_records_rejects_large_multiline_field_before_reading_to_eof(self):
+        consumed = []
+
+        def lines():
+            for i in range(1000):
+                consumed.append(i)
+                yield '"ab\n' if i == 0 else 'ab\n'
+
+        with mock.patch.object(MSSQL, "MAX_CSV_IMPORT_FIELD_CHARS", 8):
+            with self.assertRaisesRegex(csv.Error, "field larger than field limit"):
+                list(MSSQL._iter_csv_records(lines(), ","))
+        self.assertEqual(consumed, [0, 1, 2])
+
+    def test_iter_csv_records_counts_decoded_chars_and_resets_each_field(self):
+        text = '"a\nb","x""y",abc\n"ab"x,12,""\nfoo,,"bar"\n'
+        with mock.patch.object(MSSQL, "MAX_CSV_IMPORT_FIELD_CHARS", 3):
+            rows = list(MSSQL._iter_csv_records(io.StringIO(text, newline=""), ","))
+            self.assertEqual(rows, [["a\nb", 'x"y', "abc"], ["abx", "12", ""],
+                                    ["foo", None, "bar"]])
+            for field in ('"a""""b"', '"abc"d', 'abcd,"x"'):
+                with self.subTest(field=field), self.assertRaises(csv.Error):
+                    list(MSSQL._iter_csv_records(io.StringIO(field), ","))
 
     def test_import_invalid_binary_hex_obeys_abort_and_skip(self):
         for policy in ("abort", "skip"):

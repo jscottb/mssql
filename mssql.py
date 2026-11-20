@@ -26,12 +26,15 @@ import json
 import math
 import os
 import shlex
+import stat
 import struct
 import sys
 import re
 import tempfile
 import importlib
 import atexit
+import base64
+import binascii
 import time
 from io import StringIO
 from pathlib import Path
@@ -657,11 +660,19 @@ def _iter_csv_records(lines, delimiter):
     `lines` must come from a file opened with newline="" so line endings,
     including those inside quoted fields, are preserved."""
     limit = MAX_CSV_IMPORT_FIELD_CHARS
+    field_chars = 0
+
+    def _append_field(part):
+        nonlocal field_chars
+        if field_chars + len(part) > limit:
+            raise csv.Error(f"field larger than field limit ({limit})")
+        field.append(part)
+        field_chars += len(part)
 
     def _finish(field, quoted):
+        nonlocal field_chars
         text = "".join(field)
-        if len(text) > limit:
-            raise csv.Error(f"field larger than field limit ({limit})")
+        field_chars = 0
         return text if field or quoted else None
 
     record = []
@@ -686,7 +697,7 @@ def _iter_csv_records(lines, delimiter):
             if in_quotes:
                 if ch == '"':
                     if i + 1 < n and line[i + 1] == '"':
-                        field.append('"')
+                        _append_field('"')
                         i += 2
                         continue
                     in_quotes = False
@@ -696,7 +707,7 @@ def _iter_csv_records(lines, delimiter):
                     # fields would otherwise cost a Python iteration per char.
                     end = line.find('"', i)
                     end = n if end < 0 else end
-                    field.append(line[i:end])
+                    _append_field(line[i:end])
                     i = end
                 continue
             if ch == delimiter:
@@ -712,7 +723,7 @@ def _iter_csv_records(lines, delimiter):
                 yield record
                 record, field, quoted = [], [], False
             else:
-                field.append(ch)
+                _append_field(ch)
             i += 1
     # Like csv.reader (non-strict), an unterminated quoted field ends at EOF.
     if record or field or quoted:
@@ -800,7 +811,8 @@ def read_json_data(filepath, skip, fmt=""):
         # JSON Lines: one JSON object per line — fully streamable
         f = open(filepath, encoding="utf-8")
         try:
-            first_obj = None
+            missing = object()
+            first_obj = missing
             skipped = 0
             for raw_line in f:
                 raw_line = raw_line.strip()
@@ -809,9 +821,9 @@ def read_json_data(filepath, skip, fmt=""):
                 if skipped < skip:
                     skipped += 1
                     continue
-                first_obj = json.loads(raw_line)
+                first_obj = json.loads(raw_line, parse_float=decimal.Decimal)
                 break
-            if first_obj is None:
+            if first_obj is missing:
                 # Empty file (e.g. an export of an empty table): no rows.
                 f.close()
                 return iter(()), []
@@ -833,7 +845,7 @@ def read_json_data(filepath, skip, fmt=""):
                     if skipped < skip:
                         skipped += 1
                         continue
-                    obj = json.loads(raw_line)
+                    obj = json.loads(raw_line, parse_float=decimal.Decimal)
                     yield obj
             finally:
                 f.close()
@@ -852,7 +864,7 @@ def read_json_data(filepath, skip, fmt=""):
                 f"{MAX_JSON_ARRAY_IMPORT_BYTES // (1024 * 1024)} MiB limit; "
                 "convert to .jsonl to stream large imports"
             )
-        data = json.loads(raw)
+        data = json.loads(raw, parse_float=decimal.Decimal)
         if not isinstance(data, list):
             raise ValueError("JSON file must contain a top-level array of objects")
         if skip >= len(data):  # includes [] (an export of an empty table)
@@ -933,11 +945,15 @@ def _connection_ready(ctx):
     return False
 
 
-def _restore_autocommit(conn, ctx, reason):
+def _restore_autocommit(conn, ctx, reason, discard=True):
     # Discard pending work before restoring autocommit, including pymssql's
-    # empty driver transaction after commit()/rollback().
+    # empty driver transaction after commit()/rollback(). DISCARD=False skips
+    # that rollback right after a successful commit(): nothing is pending, and
+    # pymssql's autocommit(True) rolls back its empty follow-on transaction
+    # itself, so the rollback would only cost two more round trips.
     try:
-        conn.rollback()
+        if discard:
+            conn.rollback()
         _set_autocommit(conn, ctx, True)
     except DBError as error:
         ctx["connection_usable"] = False
@@ -971,10 +987,12 @@ def _mssql_owned_work(ctx, operation):
         ctx["connection_usable"] = False
         print(f"Error starting transaction: {error}. Reconnect.", file=sys.stderr)
         return False
+    ctx.pop("_owned_work_committed", None)
     try:
         result = operation()
     finally:
-        restored = _restore_autocommit(conn, ctx, "database operation")
+        committed = ctx.pop("_owned_work_committed", False)
+        restored = _restore_autocommit(conn, ctx, "database operation", discard=not committed)
     return result if restored else False
 
 
@@ -1356,29 +1374,7 @@ def export_data(arg, ctx):
         success = True
 
     except (*DBError, OSError) as e:
-        # Roll back whatever this run wrote (back to start_offset, which honors
-        # --append) so a failed export never leaves a partial file that looks
-        # complete — for any format, not just the JSON array. stdout can't seek.
-        # Temp-file (overwrite-mode) cleanup happens in the finally block below.
-        if not to_stdout and temp_output_path is None:
-            try:
-                out_f.seek(start_offset)
-                out_f.truncate()
-            except OSError:
-                pass
         print(f"\nExport error after {total:,} rows: {e}", file=sys.stderr)
-
-    except KeyboardInterrupt:
-        # Same truncate-back as a reported error above, so --append never
-        # leaves a partially-written record in an existing file. No message
-        # here — the caller's own interrupt handling reports the interruption.
-        if not to_stdout and temp_output_path is None:
-            try:
-                out_f.seek(start_offset)
-                out_f.truncate()
-            except OSError:
-                pass
-        raise
 
     finally:
         try:
@@ -1396,6 +1392,13 @@ def export_data(arg, ctx):
                 temp_output_path.unlink()
             except OSError:
                 pass
+        elif not success and not to_stdout:
+            # Close first: a buffered writer may flush more bytes even after
+            # a write error. Truncate by path even when close() itself fails.
+            try:
+                os.truncate(opts.file, start_offset)
+            except OSError as e:
+                print(f"\nExport error restoring '{label}': {e}", file=sys.stderr)
 
     if close_error is not None:
         print(f"\nExport error closing '{label}': {close_error}", file=sys.stderr)
@@ -2748,7 +2751,10 @@ def _mysql_kill_running_query(ctx):
         return False
     try:
         side_conn, _, _ = _connect_mysql(conn_args)
-    except (ValueError, *DBError):
+    except (ValueError, *DBError) as e:
+        # Say why (messages never contain secrets): without it the operator
+        # can't tell that e.g. the password or key file has gone missing.
+        print(f"Cannot open a connection to cancel the query: {e}", file=sys.stderr)
         return False
     try:
         side_cur = side_conn.cursor()
@@ -3032,13 +3038,24 @@ def _execute_sql(sql, ctx):
             if not _apply_mysql_transaction_status(conn, ctx):
                 _resync_transaction_state(conn, ctx)
         else:
+            # Commit whenever this tool owns the transaction, not just when
+            # the batch looks like a data change: pymssql hides the rowcount
+            # results of statements that precede a SELECT (as does pyodbc
+            # with SET NOCOUNT ON), so "CREATE TABLE t ...; SELECT 1" or
+            # "IF ... INSERT ...; SELECT ..." would otherwise be rolled back
+            # by _mssql_owned_work. Committing read-only work is harmless,
+            # and a no-op when the driver is in autocommit.
             if (
-                (saw_non_resultset or _starts_with_data_change_statement(sql))
-                and not has_explicit_txn_control
+                not has_explicit_txn_control
                 and not transaction_open
                 and not ctx.get("implicit_transactions")
             ):
                 conn.commit()
+                # Tells _mssql_owned_work the work is committed, so it can skip
+                # its discard. Set after commit() returns so the flag is only
+                # ever true when it is; a failed commit raises into the
+                # DBError handler below, which rolls back.
+                ctx["_owned_work_committed"] = True
 
             savepoints = set(ctx.get("savepoints", set()))
             for op, name in txn_ops:
@@ -3893,6 +3910,8 @@ ENV_FILE_GENERIC_KEYS = {
     "DB_PASSWORD": "PASSWORD",
     "DB_NAME": "DATABASE",
     "DB_DATABASE": "DATABASE",
+    "DB_FERNET_KEY": "FERNET_KEY",
+    "DB_FERNET_KEY_FILE": "FERNET_KEY_FILE",
 }
 
 
@@ -3941,9 +3960,15 @@ def load_env_file(path):
     return values
 
 
-def _resolve_env_file_values(file_values, prefix):
+# Settings that name a file. A relative path in an env file is relative to
+# the env file's own directory (as in Docker Compose), not the current one.
+ENV_FILE_PATH_SUFFIXES = ("FERNET_KEY_FILE",)
+
+
+def _resolve_env_file_values(file_values, prefix, base_dir=None):
     """Map an env file's keys onto PREFIX_* connection settings. A
-    backend-specific key (e.g. MYSQL_HOST) beats its generic DB_* alias."""
+    backend-specific key (e.g. MYSQL_HOST) beats its generic DB_* alias.
+    Relative paths in path settings are anchored at BASE_DIR when given."""
     resolved = {}
     for generic_key, suffix in ENV_FILE_GENERIC_KEYS.items():
         if generic_key in file_values:
@@ -3951,6 +3976,12 @@ def _resolve_env_file_values(file_values, prefix):
     for key, value in file_values.items():
         if key.startswith(prefix + "_"):
             resolved[key] = value
+    if base_dir is not None:
+        for suffix in ENV_FILE_PATH_SUFFIXES:
+            key = f"{prefix}_{suffix}"
+            value = resolved.get(key, "")
+            if value and not value.startswith("~") and not Path(value).is_absolute():
+                resolved[key] = str(Path(base_dir) / value)
     return resolved
 
 
@@ -3961,6 +3992,177 @@ def _conn_setting(args, name, default=""):
     if name in env_file_values:
         return env_file_values[name]
     return os.environ.get(name, default)
+
+
+PASSWORD_B64_PREFIX = "%%b64%%"
+PASSWORD_FERNET_PREFIX = "%%fernet%%"
+MAX_FERNET_KEY_FILE_BYTES = 4096
+MAX_PASSWORD_FILE_BYTES = 64 * 1024
+CRYPTOGRAPHY_INSTALL_HINT = "pip install cryptography"
+
+
+def _strip_one_newline(text):
+    """Drop one trailing newline: `echo secret | base64` (or a Fernet
+    encryption of echo's output) includes one."""
+    if text.endswith("\r\n"):
+        return text[:-2]
+    if text.endswith("\n"):
+        return text[:-1]
+    return text
+
+
+def _decode_password(value, source, fernet_key=None):
+    """Return a password, decoding it if it carries a recognized prefix.
+
+    Applies to -W/--password, --env-file values, and environment variables
+    alike. The result must be UTF-8 text, and one trailing newline is dropped.
+    Errors name SOURCE and the reason only — never the value or the key.
+
+    %%b64%%: base64. Trailing "=" padding is optional and may be wrong (it
+    carries no data, and hand-edited values often add or drop it); any other
+    character outside the base64 alphabet is an error.
+
+    %%fernet%%: a token from cryptography's Fernet. FERNET_KEY is a callable
+    returning (key_bytes, key_source), called only for such a value, so no key
+    or cryptography install is needed otherwise.
+    """
+    if value.startswith(PASSWORD_B64_PREFIX):
+        encoded = value[len(PASSWORD_B64_PREFIX):].strip().rstrip("=")
+        encoded += "=" * (-len(encoded) % 4)
+        try:
+            decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        except binascii.Error as e:
+            raise ValueError(f"{source}: invalid {PASSWORD_B64_PREFIX} base64 password ({e})") from None
+        except UnicodeDecodeError:
+            raise ValueError(f"{source}: {PASSWORD_B64_PREFIX} password does not decode to UTF-8 text") from None
+        return _strip_one_newline(decoded)
+    if value.startswith(PASSWORD_FERNET_PREFIX):
+        return _strip_one_newline(_fernet_decrypt(value[len(PASSWORD_FERNET_PREFIX):].strip(), source, fernet_key))
+    return value
+
+
+def _fernet_decrypt(token, source, fernet_key):
+    try:
+        from cryptography.fernet import Fernet, InvalidToken
+    except ImportError:
+        raise ValueError(
+            f"{source}: {PASSWORD_FERNET_PREFIX} passwords need the cryptography package. "
+            f"Run:\n  {CRYPTOGRAPHY_INSTALL_HINT}"
+        ) from None
+    if fernet_key is None:
+        raise ValueError(f"{source}: {PASSWORD_FERNET_PREFIX} password given but no Fernet key")
+    key, key_source = fernet_key()
+    try:
+        fernet = Fernet(key)
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"{key_source}: not a valid Fernet key (expected 32 url-safe base64-encoded bytes)"
+        ) from None
+    try:
+        decrypted = fernet.decrypt(token.encode("ascii", "replace"))
+    except InvalidToken:
+        raise ValueError(
+            f"{source}: cannot decrypt {PASSWORD_FERNET_PREFIX} password with the key from "
+            f"{key_source} (wrong key, or a damaged token)"
+        ) from None
+    try:
+        return decrypted.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{source}: {PASSWORD_FERNET_PREFIX} password does not decrypt to UTF-8 text") from None
+
+
+# Secret sources that can be read only once (process substitution such as
+# --password-file <(pass show db), /dev/stdin, named pipes): the bytes from
+# the first read, keyed by path, so .reconnect and MySQL's KILL QUERY side
+# connection don't get an already-drained pipe. Regular files are re-read,
+# so a password rotated on disk is picked up by .reconnect.
+_ONE_SHOT_SECRET_CACHE = {}
+
+
+def _read_secret_file(path, source, what, max_bytes):
+    """Read a small file holding a secret (WHAT names it in messages). Warns
+    when other users can read or write a regular file. Rejects empty files.
+    Errors never include its contents."""
+    path = Path(path).expanduser()
+    cache_key = str(path)
+    if cache_key in _ONE_SHOT_SECRET_CACHE:
+        return _ONE_SHOT_SECRET_CACHE[cache_key]
+    try:
+        with path.open("rb") as f:
+            mode = os.fstat(f.fileno()).st_mode
+            data = f.read(max_bytes + 1)
+    except OSError as e:
+        raise ValueError(f"{source}: cannot read {what} '{path}': {e.strerror or e}") from None
+    if len(data) > max_bytes:
+        raise ValueError(f"{source}: {what} '{path}' is larger than {max_bytes} bytes")
+    if not data.strip():
+        # Usually a failed producer (e.g. a locked password store) or a
+        # truncated file; an empty password would only yield "Login failed".
+        raise ValueError(f"{source}: {what} '{path}' is empty")
+    regular = stat.S_ISREG(mode)
+    if regular and os.name == "posix":
+        # Group/other read exposes the secret; write lets someone swap it.
+        # (Pipes and terminals are transient; their modes say nothing useful.)
+        access = "readable" if mode & 0o044 else "writable" if mode & 0o022 else ""
+        if access or mode & 0o011:
+            print(f"Warning: {what} '{path}' is {access or 'accessible'} by other users; "
+                  f"run: chmod 600 '{path}'", file=sys.stderr)
+    if not regular:
+        _ONE_SHOT_SECRET_CACHE[cache_key] = data
+    return data
+
+
+def _read_fernet_key_file(path, source):
+    """Read a Fernet key from a file. Errors never include its contents."""
+    return _read_secret_file(path, source, "Fernet key file", MAX_FERNET_KEY_FILE_BYTES).strip()
+
+
+def _read_password_file(path):
+    """Read --password-file: UTF-8 text, one trailing newline dropped. The
+    text may carry a %%b64%% or %%fernet%% prefix like any other password."""
+    data = _read_secret_file(path, "--password-file", "password file", MAX_PASSWORD_FILE_BYTES)
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ValueError(f"--password-file: '{Path(path).expanduser()}' is not UTF-8 text") from None
+    return _strip_one_newline(text)
+
+
+def _fernet_key_loader(args, backend):
+    """Return a callable that finds the Fernet key: --fernet-key-file, then the
+    --env-file's BACKEND_FERNET_KEY_FILE / BACKEND_FERNET_KEY, then the process
+    environment's. Within each source a key file beats an inline key, but the
+    env file as a whole beats the environment, as for every other setting."""
+    def load():
+        flag_path = getattr(args, "fernet_key_file", "") or ""
+        if flag_path:
+            return _read_fernet_key_file(flag_path, "--fernet-key-file"), f"--fernet-key-file '{flag_path}'"
+        file_name, key_name = f"{backend}_FERNET_KEY_FILE", f"{backend}_FERNET_KEY"
+        env_file_values = getattr(args, "env_file_values", None) or {}
+        for values, where in ((env_file_values, "--env-file "), (os.environ, "")):
+            key_path = values.get(file_name, "")
+            if key_path:
+                return _read_fernet_key_file(key_path, f"{where}{file_name}"), f"{where}{file_name} '{key_path}'"
+            key = values.get(key_name, "").strip()
+            if key:
+                return key.encode("ascii", "replace"), f"{where}{key_name}"
+        raise ValueError(
+            f"{PASSWORD_FERNET_PREFIX} password needs a Fernet key: use --fernet-key-file, "
+            f"{file_name}, or {key_name}"
+        )
+    return load
+
+
+def _resolve_password(args, name):
+    """Password from -W or --password-file, else --env-file/environment NAME,
+    decoded per its %%b64%% / %%fernet%% prefix."""
+    fernet_key = _fernet_key_loader(args, name.split("_", 1)[0])
+    if args.password is not None:
+        return _decode_password(args.password, "--password", fernet_key)
+    password_file = getattr(args, "password_file", "") or ""
+    if password_file:
+        return _decode_password(_read_password_file(password_file), "--password-file", fernet_key)
+    return _decode_password(_conn_setting(args, name, ""), name, fernet_key)
 
 
 def _connect_sql_auth(args):
@@ -3978,8 +4180,7 @@ def _connect_sql_auth(args):
     except ValueError:
         raise ValueError(f"invalid MSSQL_PORT '{port_env}'")
     user     = args.user     or _conn_setting(args, "MSSQL_USER",     "")
-    password = (args.password if args.password is not None
-                else _conn_setting(args, "MSSQL_PASSWORD", ""))
+    password = _resolve_password(args, "MSSQL_PASSWORD")
     database = args.database or _conn_setting(args, "MSSQL_DATABASE", "")
 
     if not user:
@@ -4155,8 +4356,7 @@ def _connect_mysql(args):
     except ValueError:
         raise ValueError(f"invalid MYSQL_PORT '{port_env}'")
     user     = args.user     or _conn_setting(args, "MYSQL_USER",     "")
-    password = (args.password if args.password is not None
-                else _conn_setting(args, "MYSQL_PASSWORD", ""))
+    password = _resolve_password(args, "MYSQL_PASSWORD")
     database = args.database or _conn_setting(args, "MYSQL_DATABASE", "")
 
     if not user:
@@ -4248,9 +4448,12 @@ def _normalize_cli_args(args, parser):
             "--command, --file, or positional SQL_FILE"
         )
 
-    if args.trusted_connection and (args.user or args.password is not None):
+    if args.password is not None and args.password_file:
+        parser.error("--password/-W and --password-file are mutually exclusive")
+    if args.trusted_connection and (args.user or args.password is not None or args.password_file):
         parser.error(
-            "--trusted-connection cannot be combined with --user/-U or --password/-W"
+            "--trusted-connection cannot be combined with --user/-U, --password/-W, "
+            "or --password-file"
         )
     if args.mysql and (args.trusted_connection or args.odbc_driver or args.trust_server_certificate):
         parser.error(
@@ -4313,6 +4516,12 @@ Environment variables: MSSQL_HOST, MSSQL_PORT, MSSQL_USER, MSSQL_PASSWORD, MSSQL
 With --mysql instead:  MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE
 --env-file accepts those names or generic DB_HOST, DB_PORT, DB_USER, DB_PASSWORD,
 DB_NAME; precedence is command-line flags, then the env file, then the environment.
+A password from any source prefixed with %%%%b64%%%% is base64-decoded first,
+e.g. MSSQL_PASSWORD=%%%%b64%%%%c2VjcmV0 (one trailing newline is dropped).
+A password prefixed with %%%%fernet%%%% is a Fernet token, decrypted with the key
+from --fernet-key-file, MSSQL_FERNET_KEY_FILE or MSSQL_FERNET_KEY (MYSQL_* with
+--mysql; DB_FERNET_KEY_FILE / DB_FERNET_KEY in an env file).
+--password-file FILE reads the password (plain, %%%%b64%%%% or %%%%fernet%%%%) from a file.
         """,
     )
 
@@ -4323,13 +4532,24 @@ DB_NAME; precedence is command-line flags, then the env file, then the environme
     conn_grp.add_argument("-U", "--user",     default="", metavar="USER",     help="Login username")
     conn_grp.add_argument(
         "-W", "--password", default=None, metavar="PASSWORD",
-        help="Login password (prefer MSSQL_PASSWORD/MYSQL_PASSWORD; avoid putting secrets on command lines)",
+        help="Login password (prefer MSSQL_PASSWORD/MYSQL_PASSWORD; avoid putting secrets on command lines). "
+             "Prefix with %%%%b64%%%% to pass it base64-encoded",
+    )
+    conn_grp.add_argument(
+        "--password-file", default="", metavar="FILE", dest="password_file",
+        help="Read the login password from FILE (one trailing newline is dropped); "
+             "it may be %%%%b64%%%%- or %%%%fernet%%%%-prefixed like any password",
     )
     conn_grp.add_argument("-d", "--database", default="", metavar="DATABASE", help="Database name")
     conn_grp.add_argument(
         "--env-file", default="", metavar="FILE", dest="env_file",
         help="Read connection settings from a dotenv-style KEY=VALUE file "
              "(overrides environment variables; flags still win)",
+    )
+    conn_grp.add_argument(
+        "--fernet-key-file", default="", metavar="FILE", dest="fernet_key_file",
+        help="Fernet key for a %%%%fernet%%%%-encrypted password (or MSSQL_FERNET_KEY_FILE / "
+             "MSSQL_FERNET_KEY; MYSQL_* with --mysql). Requires the cryptography package",
     )
     conn_grp.add_argument("--timeout",        default=30, type=int, metavar="SECS", help="Login timeout in seconds (default: 30)")
     conn_grp.add_argument("--query-timeout",  default=30, type=int, metavar="SECS", help="Query timeout in seconds (default: 30)")
@@ -4390,7 +4610,8 @@ DB_NAME; precedence is command-line flags, then the env file, then the environme
     if args.env_file:
         try:
             args.env_file_values = _resolve_env_file_values(
-                load_env_file(args.env_file), "MYSQL" if args.mysql else "MSSQL"
+                load_env_file(args.env_file), "MYSQL" if args.mysql else "MSSQL",
+                base_dir=Path(args.env_file).expanduser().parent,
             )
         except (OSError, ValueError) as e:
             print(f"Error reading env file: {e}", file=sys.stderr)

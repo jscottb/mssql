@@ -74,12 +74,67 @@ A missing or malformed file stops the tool before it connects (exit code 1). Err
 
 ### Precedence
 
-1. Command-line flags (`-H`, `-P`, `-U`, `-W`, `-d`, positional database)
+1. Command-line flags (`-H`, `-P`, `-U`, `-W` or `--password-file`, `-d`, positional database)
 2. Values from `--env-file`
 3. Environment variables (`MSSQL_*`, or `MYSQL_*` with `--mysql`)
 4. Built-in defaults: host `localhost`, port 1433 (3306 for MySQL)
 
 An explicitly empty password (`--password ''`) overrides a password from the env file or environment. MySQL passwords are sent as UTF-8.
+
+### Base64-encoded passwords
+
+A password that starts with `%%b64%%` is base64-decoded before it is used, wherever it comes from: `-W`/`--password`, an `--env-file`, or the `MSSQL_PASSWORD`/`MYSQL_PASSWORD` environment variable. This keeps passwords with quotes, `#`, `$` or spaces out of shell and dotenv quoting rules.
+
+```bash
+$ echo 'ThisIsMyPassword' | base64
+VGhpc0lzTXlQYXNzd29yZAo=
+$ export MSSQL_PASSWORD='%%b64%%VGhpc0lzTXlQYXNzd29yZAo='
+```
+
+The decoded bytes must be valid UTF-8. One trailing newline (`\n` or `\r\n`) is dropped, since `echo ... | base64` encodes one; use `printf '%s'` if the password really ends in a newline. Trailing `=` padding is optional and may be off (a hand-added `=` is ignored), but spaces or any other character outside the base64 alphabet are rejected. Invalid base64 stops the tool before it connects (exit code 1); the error names the source and the reason but never the value. Base64 is an encoding, not encryption: anyone who can read the value can decode it.
+
+### Fernet-encrypted passwords
+
+A password that starts with `%%fernet%%` is a [Fernet](https://cryptography.io/en/latest/fernet/) token, decrypted with a key you keep somewhere else. Like `%%b64%%`, it works from `-W`, an `--env-file`, or the environment. It needs the `cryptography` package (`pip install cryptography`), which is loaded only when such a password is used.
+
+Create a key once, keep it private, and encrypt the password with it:
+
+```bash
+$ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())" > ~/.mssql.key
+$ chmod 600 ~/.mssql.key
+$ python3 -c "import getpass, pathlib; from cryptography.fernet import Fernet; \
+    f = Fernet(pathlib.Path('~/.mssql.key').expanduser().read_bytes().strip()); \
+    print('%%fernet%%' + f.encrypt(getpass.getpass().encode()).decode())"
+Password:
+%%fernet%%gAAAAABp...
+```
+
+Put the printed value in `MSSQL_PASSWORD` (or `MYSQL_PASSWORD`, or `DB_PASSWORD` in an env file), or save it in a file for `--password-file` (see below), and point the tool at the key. The first of these that is set wins:
+
+1. `--fernet-key-file FILE`
+2. In the `--env-file`: `MSSQL_FERNET_KEY_FILE` (`MYSQL_FERNET_KEY_FILE` with `--mysql`, or `DB_FERNET_KEY_FILE`), the path to a key file; then `MSSQL_FERNET_KEY` (`MYSQL_FERNET_KEY`, or `DB_FERNET_KEY`), the key itself
+3. In the process environment: `MSSQL_FERNET_KEY_FILE`, then `MSSQL_FERNET_KEY` (`MYSQL_*` with `--mysql`)
+
+So a key named in the env file always beats one exported in your shell, as with other settings; a relative key-file path in an env file is relative to the env file's directory. Keep the key out of the file that holds the token, or the encryption adds nothing. A key file that other users can read or write draws a warning (`chmod 600` it). A wrong key or a damaged token stops the tool before it connects (exit code 1); errors name where the key came from but never show the key, the token or the password. One trailing newline in the decrypted text is dropped, as with `%%b64%%`.
+
+### Password files
+
+`--password-file FILE` reads the password from a file instead of the command line, so it never appears in shell history or process listings. The contents are treated exactly like a `-W` value: plain text, `%%b64%%…`, or `%%fernet%%…` (decrypted with the key from the sources above). One trailing newline is dropped, and so is a UTF-8 byte-order mark; other leading or trailing spaces are part of the password.
+
+```bash
+$ python3 -c "...encrypt as above..." > ~/.mssql.pw && chmod 600 ~/.mssql.pw
+$ python3 mssql.py -H myserver -U app -d mydb --password-file ~/.mssql.pw --fernet-key-file ~/.mssql.key
+```
+
+Like `-W`, it beats a password from an env file or the environment. It cannot be combined with `-W` or `-E`. The file must be UTF-8, non-empty, and at most 64 KiB (an empty file, for example from a password store that failed to unlock, stops the tool before it connects rather than sending an empty password). A regular file that other users can read or write draws a warning, and errors never show its contents.
+
+Process substitution keeps the secret off disk entirely, and works for the key too:
+
+```bash
+$ python3 mssql.py --env-file app.env --password-file <(pass show db/app) --fernet-key-file <(pass show db/key)
+```
+
+A pipe like this can be read only once, so the tool keeps what it read and reuses it for `.reconnect` (and, with `--mysql`, for the side connection that cancels a timed-out query). A regular file is read again on each reconnect, so a password changed on disk takes effect at the next `.reconnect`.
 
 ### Timeouts
 
@@ -389,9 +444,11 @@ python3 mssql.py [OPTIONS] [DATABASE] [SQL_FILE]
 | `-H`, `--host HOST` | `localhost` | Server hostname |
 | `-P`, `--port PORT` | 1433 (3306 with `--mysql`) | Server port |
 | `-U`, `--user USER` | None | Login name; required except with `-E` |
-| `-W`, `--password PASSWORD` | Empty | Login password; prefer the environment or an env file |
+| `-W`, `--password PASSWORD` | Empty | Login password; prefer the environment or an env file. A `%%b64%%` prefix marks it base64-encoded |
 | `-d`, `--database DATABASE` | Server default | Database to use |
 | `--env-file FILE` | None | Reads connection settings from a dotenv file |
+| `--password-file FILE` | None | Reads the password (plain, `%%b64%%` or `%%fernet%%`) from a file |
+| `--fernet-key-file FILE` | None | Key for a `%%fernet%%`-encrypted password |
 | `--timeout SECS` | 30 | Login/connect timeout |
 | `--query-timeout SECS` | 30 | Per-query timeout |
 | `--mysql` | Off | Connects to MySQL with pymysql |
@@ -420,6 +477,8 @@ python3 mssql.py [OPTIONS] [DATABASE] [SQL_FILE]
 | `MSSQL_USER` | `MYSQL_USER` | `DB_USER` | Login name |
 | `MSSQL_PASSWORD` | `MYSQL_PASSWORD` | `DB_PASSWORD` | Login password |
 | `MSSQL_DATABASE` | `MYSQL_DATABASE` | `DB_NAME`, `DB_DATABASE` | Database |
+| `MSSQL_FERNET_KEY_FILE` | `MYSQL_FERNET_KEY_FILE` | `DB_FERNET_KEY_FILE` | Fernet key file for a `%%fernet%%` password |
+| `MSSQL_FERNET_KEY` | `MYSQL_FERNET_KEY` | `DB_FERNET_KEY` | Fernet key for a `%%fernet%%` password |
 | `MSSQL_ODBC_DRIVER` | | | ODBC driver name for `-E` |
 
 The generic names are read only from an `--env-file`, never from the process environment.
