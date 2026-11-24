@@ -2255,6 +2255,14 @@ Dot commands:
       --insert TABLE           Also switch to insert mode targeting TABLE
       --append                 Append to file instead of overwriting
   .read FILE                 Execute SQL from a file
+  .macro SUBCOMMAND ...      Saved SQL macros, per database (stored in ~/.mssql_macros)
+      add NAME "SQL"           Save a new macro; %1, %2, ... are parameters
+      edit NAME "SQL"          Replace an existing macro's text
+      delete NAME              Delete a macro
+      list                     List macro names and the start of their text
+      use NAME [ARGS...]       Put the macro on the input line to edit and run
+      exec NAME [ARGS...]      Run the macro; ARGS replace %1, %2, ... in order
+                               (%% is a literal %)
   .reconnect                 Reconnect using the original connection parameters
                                (use after a dropped/lost connection)
   .timer on|off              Toggle query execution time display
@@ -2325,6 +2333,306 @@ _MYSQL_PATTERN_CMDS = {
         "ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME"
     ),
 }
+
+
+# ── Macros ─────────────────────────────────────────────────────────────────────
+
+MACRO_FILE = Path.home() / ".mssql_macros"
+
+MACRO_SUBCOMMANDS = ["add", "delete", "edit", "exec", "list", "use"]
+
+MACRO_LIST_PREVIEW_CHARS = 60
+
+MACRO_USAGE = """\
+Usage: .macro add NAME "SQL"      Save a new macro
+       .macro edit NAME "SQL"     Replace an existing macro's text
+       .macro delete NAME         Delete a macro
+       .macro list                List macros
+       .macro use NAME [ARGS...]  Put the macro on the input line for editing
+       .macro exec NAME [ARGS...] Run the macro, replacing %1, %2, ... with ARGS"""
+
+_MACRO_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+
+# %1, %2, ... are parameters; %% is a literal % (so LIKE '%%1%%' can match "1").
+_MACRO_PARAM_RE = re.compile(r"%%|%(\d+)")
+
+
+# Key for macros saved while connected without a database name.
+MACRO_NO_DATABASE_KEY = "(default)"
+
+
+def _macro_database_key(ctx):
+    """Macros are stored per database, keyed by the database name from the
+    connection settings (-d, DBNAME, MSSQL_DATABASE/MYSQL_DATABASE), compared
+    case-insensitively. A later USE does not change it."""
+    return (ctx.get("database") or "").strip().lower() or MACRO_NO_DATABASE_KEY
+
+
+def _load_macro_file():
+    """Read the macro file into {database: {name: SQL text}}.
+
+    Raises ValueError when the file exists but is unreadable or malformed, so
+    callers never overwrite a file they could not parse."""
+    try:
+        raw = MACRO_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"cannot read '{MACRO_FILE}': {e}") from None
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"'{MACRO_FILE}' is not valid JSON: {e}") from None
+    if not isinstance(data, dict) or not all(
+        isinstance(macros, dict)
+        and all(isinstance(k, str) and isinstance(v, str) for k, v in macros.items())
+        for macros in data.values()
+    ):
+        raise ValueError(
+            f"'{MACRO_FILE}' must be a JSON object mapping database names to "
+            "objects of macro name -> SQL text"
+        )
+    return data
+
+
+def _load_macros(ctx):
+    """Return (all_databases_data, this_database_macros); the second is the
+    mutable dict inside the first."""
+    data = _load_macro_file()
+    return data, data.setdefault(_macro_database_key(ctx), {})
+
+
+def _save_macros(data):
+    """Atomically write all databases' macros to MACRO_FILE (private to the user)."""
+    data = {database: macros for database, macros in data.items() if macros}
+    directory = MACRO_FILE.parent
+    fd, tmp_path = tempfile.mkstemp(prefix=".mssql_macros.", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.write("\n")
+        os.replace(tmp_path, MACRO_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _macro_text_arg(text):
+    """Return macro SQL from the rest of a .macro add/edit line.
+
+    A single quoted argument ("select ... '%1'") is unquoted; anything else is
+    taken verbatim, so unquoted SQL works too."""
+    text = text.strip()
+    if text[:1] in ("'", '"'):
+        try:
+            parts = _split_dot_command_args(text)
+        except ValueError:
+            parts = None
+        if parts is not None and len(parts) == 1:
+            return parts[0]
+    return text
+
+
+def expand_macro(text, args):
+    """Replace %N with args[N-1] and %% with %.
+
+    Substitution is plain text (quote the placeholder in the macro, e.g.
+    '%1', when the value is a string). Returns (sql, unused_arg_count);
+    raises ValueError when the macro references a missing argument."""
+    missing = set()
+    used = set()
+
+    def replace(m):
+        if m.group(1) is None:
+            return "%"
+        n = int(m.group(1))
+        if 1 <= n <= len(args):
+            used.add(n)
+            return args[n - 1]
+        missing.add(n)
+        return m.group(0)
+
+    sql = _MACRO_PARAM_RE.sub(replace, text)
+    if missing:
+        needed = ", ".join(f"%{n}" for n in sorted(missing))
+        raise ValueError(
+            f"missing argument(s) for {needed} "
+            f"({len(args)} argument(s) given)"
+        )
+    return sql, len(args) - len(used)
+
+
+def _macro_list_lines(macros):
+    width = max(len(name) for name in macros)
+    lines = []
+    for name in sorted(macros):
+        preview = " ".join(macros[name].split())
+        if len(preview) > MACRO_LIST_PREVIEW_CHARS:
+            preview = preview[:MACRO_LIST_PREVIEW_CHARS] + "..."
+        lines.append(f"{name:<{width}}  {preview}")
+    return lines
+
+
+def _prefill_supported():
+    return (
+        readline is not None
+        and hasattr(readline, "insert_text")
+        and (hasattr(readline, "set_pre_input_hook") or hasattr(readline, "set_startup_hook"))
+    )
+
+
+def _input_with_prefill(prompt, text):
+    """input() with TEXT already typed on the line, ready to edit."""
+    if hasattr(readline, "set_pre_input_hook"):
+        set_hook = readline.set_pre_input_hook
+
+        def hook():
+            readline.insert_text(text)
+            redisplay = getattr(readline, "redisplay", None)
+            if redisplay is not None:
+                redisplay()
+    else:
+        set_hook = readline.set_startup_hook
+
+        def hook():
+            readline.insert_text(text)
+
+    set_hook(hook)
+    try:
+        return input(prompt)
+    finally:
+        set_hook(None)
+
+
+def run_macro_command(arg, ctx):
+    """Handle `.macro SUBCOMMAND ...`."""
+    parts = arg.split(None, 1)
+    if not parts:
+        print(MACRO_USAGE, file=sys.stderr)
+        return
+    sub = parts[0].lower()
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    if sub not in MACRO_SUBCOMMANDS:
+        print(f"Unknown .macro subcommand '{parts[0]}'.", file=sys.stderr)
+        print(MACRO_USAGE, file=sys.stderr)
+        return
+
+    try:
+        data, macros = _load_macros(ctx)
+    except ValueError as e:
+        print(f"Macro error: {e}", file=sys.stderr)
+        return
+    database = _macro_database_key(ctx)
+
+    if sub == "list":
+        if rest:
+            print("Usage: .macro list", file=sys.stderr)
+            return
+        if not macros:
+            print(f"No macros defined for database '{database}' (file: {MACRO_FILE}).", file=sys.stderr)
+            return
+        print(f"Macros for database '{database}':", file=sys.stderr)
+        for line in _macro_list_lines(macros):
+            print(line)
+        return
+
+    name_parts = rest.split(None, 1)
+    if not name_parts:
+        print(MACRO_USAGE, file=sys.stderr)
+        return
+    name = name_parts[0]
+    tail = name_parts[1].strip() if len(name_parts) > 1 else ""
+
+    if sub in ("add", "edit"):
+        if not _MACRO_NAME_RE.match(name):
+            print(
+                f"Invalid macro name '{name}': use letters, digits, '_', '.', '-'.",
+                file=sys.stderr,
+            )
+            return
+        text = _macro_text_arg(tail) if tail else ""
+        if not text.strip():
+            print(f'Usage: .macro {sub} NAME "SQL"', file=sys.stderr)
+            return
+        if sub == "add" and name in macros:
+            print(
+                f"Macro '{name}' already exists; use .macro edit to replace it.",
+                file=sys.stderr,
+            )
+            return
+        if sub == "edit" and name not in macros:
+            print(
+                f"No macro named '{name}' for database '{database}'; use .macro add to create it.",
+                file=sys.stderr,
+            )
+            return
+        macros[name] = text
+        try:
+            _save_macros(data)
+        except OSError as e:
+            print(f"Error saving macros to '{MACRO_FILE}': {e}", file=sys.stderr)
+            return
+        print(f"Macro '{name}' {'saved' if sub == 'add' else 'updated'}.", file=sys.stderr)
+        return
+
+    if name not in macros:
+        print(f"No macro named '{name}' for database '{database}'. Try .macro list", file=sys.stderr)
+        return
+
+    if sub == "delete":
+        if tail:
+            print("Usage: .macro delete NAME", file=sys.stderr)
+            return
+        del macros[name]
+        try:
+            _save_macros(data)
+        except OSError as e:
+            print(f"Error saving macros to '{MACRO_FILE}': {e}", file=sys.stderr)
+            return
+        print(f"Macro '{name}' deleted.", file=sys.stderr)
+        return
+
+    # use / exec: optional shell-style arguments for %1, %2, ...
+    try:
+        args = _split_dot_command_args(tail) if tail else []
+    except ValueError as e:
+        print(f".macro {sub} parse error: {e}", file=sys.stderr)
+        return
+    text = macros[name]
+    if args or sub == "exec":
+        try:
+            text, unused = expand_macro(text, args)
+        except ValueError as e:
+            print(f"Macro '{name}': {e}", file=sys.stderr)
+            return
+        if unused:
+            print(f"Warning: macro '{name}' ignored {unused} extra argument(s).", file=sys.stderr)
+
+    if sub == "use":
+        if not ctx.get("interactive") or not _prefill_supported() or "\n" in text or "\r" in text:
+            # Can't place it on the input line; show it so it can be copied.
+            print("Cannot place the macro on the input line; its text is:", file=sys.stderr)
+            print(text, file=sys.stderr)
+            return
+        ctx["pending_input"] = text
+        return
+
+    # exec
+    if not text.strip():
+        print(f"Macro '{name}' is empty.", file=sys.stderr)
+        return
+    try:
+        batches = split_batches(text, _dialect(ctx))
+    except ValueError as e:
+        print(f"Macro '{name}': {e}", file=sys.stderr)
+        return
+    for batch in batches:
+        execute_sql(batch, ctx)
 
 
 def run_dot_command(cmd_line, ctx):
@@ -2611,6 +2919,7 @@ def run_dot_command(cmd_line, ctx):
         ctx["driver_version"]    = new_driver["version"]
         ctx["paramstyle"]        = new_driver["paramstyle"]
         ctx["dialect"]           = new_driver.get("dialect", "mssql")
+        ctx["database"]          = new_driver.get("database")
         ctx["transaction_depth"] = 0
         ctx["transaction_open"]  = False
         ctx["savepoints"]        = set()
@@ -2632,6 +2941,9 @@ def run_dot_command(cmd_line, ctx):
             print("Usage: .read FILE", file=sys.stderr)
             return True
         execute_file(read_parts[0], ctx)
+
+    elif cmd == ".macro":
+        run_macro_command(arg, ctx)
 
     else:
         return False  # unknown command
@@ -3692,7 +4004,7 @@ else:
     HISTORY_FILE = Path.home() / ".mssql_query_history"
 
 
-def setup_readline():
+def setup_readline(ctx=None):
     """Configure readline with history and tab completion."""
     if readline is None:
         return
@@ -3734,7 +4046,7 @@ def setup_readline():
     DOT_COMMANDS = [
         ".tables", ".schema", ".databases", ".columns", ".views", ".procs",
         ".export", ".import", ".mode", ".headers", ".output", ".read",
-        ".reconnect", ".timer", ".rowcount", ".quit", ".exit", ".help",
+        ".macro", ".reconnect", ".timer", ".rowcount", ".quit", ".exit", ".help",
     ]
 
     completer_items = SQL_KEYWORDS + [k.lower() for k in SQL_KEYWORDS] + DOT_COMMANDS
@@ -3743,10 +4055,29 @@ def setup_readline():
     # for each candidate, so recomputing for every state is wasteful.
     _cache = [None, []]   # [last_text, last_matches]
 
+    get_line_buffer = getattr(readline, "get_line_buffer", None)
+    get_begidx = getattr(readline, "get_begidx", None)
+
+    def _candidates(text):
+        # After ".macro", complete subcommands, then macro names.
+        if get_line_buffer is not None and get_begidx is not None:
+            words = get_line_buffer()[:get_begidx()].split()
+            if words and words[0].lower() == ".macro":
+                if len(words) == 1:
+                    return [c for c in MACRO_SUBCOMMANDS if c.startswith(text)]
+                if len(words) == 2 and words[1].lower() in ("delete", "edit", "use", "exec"):
+                    try:
+                        _, names = _load_macros(ctx or {})
+                    except ValueError:
+                        return []
+                    return sorted(n for n in names if n.startswith(text))
+                return []
+        return [c for c in completer_items if c.startswith(text)]
+
     def completer(text, state):
-        if text != _cache[0]:
+        if state == 0:
             _cache[0] = text
-            _cache[1] = [c for c in completer_items if c.startswith(text)]
+            _cache[1] = _candidates(text)
         matches = _cache[1]
         return matches[state] if state < len(matches) else None
 
@@ -3801,7 +4132,8 @@ def interactive_loop(ctx):
     print("Type .help for help, .quit to exit. Terminate SQL with ; or GO.")
     print()
 
-    setup_readline()
+    setup_readline(ctx)
+    ctx["interactive"] = True
 
     buffer = []
     continuation = False
@@ -3824,7 +4156,11 @@ def interactive_loop(ctx):
     while True:
         try:
             prompt = "   ...> " if continuation else f"{dialect}> "
-            line = input(prompt)
+            prefill = ctx.pop("pending_input", None)
+            if prefill is not None and not continuation:
+                line = _input_with_prefill(prompt, prefill)
+            else:
+                line = input(prompt)
         except EOFError:
             print()
             break
@@ -4153,16 +4489,135 @@ def _fernet_key_loader(args, backend):
     return load
 
 
+def _raw_password(args, name):
+    """Return (raw_value, source, description) for the password before
+    decoding: -W, then --password-file, then --env-file / environment NAME.
+    SOURCE labels errors; DESCRIPTION says where it came from (for
+    --check-password) and is None when no password is set anywhere."""
+    if args.password is not None:
+        return args.password, "--password", "-W/--password"
+    password_file = getattr(args, "password_file", "") or ""
+    if password_file:
+        return _read_password_file(password_file), "--password-file", f"--password-file '{password_file}'"
+    env_file_values = getattr(args, "env_file_values", None) or {}
+    if name in env_file_values:
+        return env_file_values[name], name, f"--env-file '{getattr(args, 'env_file', '')}' ({name} or DB_PASSWORD)"
+    if name in os.environ:
+        return os.environ[name], name, f"environment variable {name}"
+    return "", name, None
+
+
 def _resolve_password(args, name):
     """Password from -W or --password-file, else --env-file/environment NAME,
     decoded per its %%b64%% / %%fernet%% prefix."""
     fernet_key = _fernet_key_loader(args, name.split("_", 1)[0])
-    if args.password is not None:
-        return _decode_password(args.password, "--password", fernet_key)
-    password_file = getattr(args, "password_file", "") or ""
-    if password_file:
-        return _decode_password(_read_password_file(password_file), "--password-file", fernet_key)
-    return _decode_password(_conn_setting(args, name, ""), name, fernet_key)
+    raw, source, _ = _raw_password(args, name)
+    return _decode_password(raw, source, fernet_key)
+
+
+def _password_char_warnings(text):
+    """Describe characters in TEXT that commonly break a login without
+    revealing the text itself."""
+    warnings = []
+    if text != text.strip():
+        warnings.append("leading or trailing whitespace")
+    controls = sorted({f"U+{ord(c):04X}" for c in text if ord(c) < 0x20 or ord(c) == 0x7F})
+    if controls:
+        warnings.append("control character(s) " + ", ".join(controls)
+                        + " (e.g. a carriage return from a Windows-edited file)")
+    if any(c in text for c in " ​﻿"):
+        warnings.append("non-breaking/zero-width space or byte-order mark (often from copy-paste)")
+    if any(ord(c) > 0x7F for c in text):
+        warnings.append("non-ASCII characters (the server must compare them as the same characters)")
+    return warnings
+
+
+def check_password(args, stdin=None, prompt=None):
+    """--check-password: resolve the login password exactly as a connect
+    would, report where it came from, how it was decoded, its length and a
+    short SHA-256 fingerprint, and flag suspicious characters. Optionally
+    compares it with a password typed at a hidden prompt. Never prints the
+    password, token, or key, and never connects. Returns the exit code."""
+    import getpass
+    import hashlib
+    import hmac
+
+    stdin = stdin or sys.stdin
+    prompt = prompt or getpass.getpass
+    mysql = getattr(args, "mysql", False)
+    prefix = "MYSQL" if mysql else "MSSQL"
+    out = sys.stderr
+
+    host = args.host or _conn_setting(args, f"{prefix}_HOST", "localhost")
+    port = args.port or _conn_setting(args, f"{prefix}_PORT", "3306" if mysql else "1433")
+    user = args.user or _conn_setting(args, f"{prefix}_USER", "")
+    database = args.database or _conn_setting(args, f"{prefix}_DATABASE", "")
+
+    key_used = []
+    loader = _fernet_key_loader(args, prefix)
+
+    def recording_loader():
+        key, key_source = loader()
+        key_used.append(key_source)
+        return key, key_source
+
+    try:
+        raw, source, description = _raw_password(args, f"{prefix}_PASSWORD")
+        password = _decode_password(raw, source, recording_loader)
+    except ValueError as e:
+        print(f"Password check failed: {e}", file=out)
+        return 1
+
+    if raw.startswith(PASSWORD_B64_PREFIX):
+        encoding = f"{PASSWORD_B64_PREFIX} (base64-decoded)"
+    elif raw.startswith(PASSWORD_FERNET_PREFIX):
+        encoding = f"{PASSWORD_FERNET_PREFIX} (decrypted with key from {key_used[0]})"
+    else:
+        encoding = "none (used as plain text)"
+    fingerprint = hashlib.sha256(password.encode("utf-8")).hexdigest()[:16]
+
+    print("Password check (no connection is made):", file=out)
+    print(f"  backend:   {'MySQL (pymysql)' if mysql else 'SQL Server (pymssql)'}", file=out)
+    print(f"  server:    {host}:{port}   database: {database or '(server default)'}", file=out)
+    print(f"  user:      '{user}'" if user else "  user:      (none set)", file=out)
+    print(f"  source:    {description or '(none: no password set anywhere)'}", file=out)
+    print(f"  encoding:  {encoding}", file=out)
+    print(f"  length:    {len(password)} characters, {len(password.encode('utf-8'))} UTF-8 bytes", file=out)
+    print(f"  sha256:    {fingerprint}…  (compare: printf '%s' 'EXPECTED' | sha256sum)", file=out)
+
+    warnings = _password_char_warnings(password)
+    if user and user != user.strip():
+        warnings.append("user name has leading or trailing whitespace")
+    if user and "\\" in user and not mysql:
+        warnings.append("user looks like DOMAIN\\user: pymssql will try NTLM, not a SQL login")
+    if not user:
+        warnings.append("no user set: a SQL login needs -U or " + f"{prefix}_USER")
+    if not password:
+        warnings.append("password is empty")
+    for warning in warnings:
+        print(f"  warning:   {warning}", file=out)
+
+    if not stdin.isatty():
+        return 0
+    try:
+        expected = prompt("Type the expected password to compare (Enter to skip): ")
+    except (EOFError, KeyboardInterrupt):
+        print(file=out)
+        return 0
+    if not expected:
+        return 0
+    if hmac.compare_digest(expected.encode("utf-8"), password.encode("utf-8")):
+        print("  compare:   MATCH — the tool sends exactly what you typed; "
+              "a login failure is not a password-decoding problem", file=out)
+        return 0
+    detail = f"expected {len(expected)} characters, resolved {len(password)}"
+    if len(expected) == len(password):
+        first = next(i for i, (a, b) in enumerate(zip(expected, password)) if a != b)
+        detail += f"; first difference at character {first + 1}"
+    elif password.startswith(expected) or expected.startswith(password):
+        detail += "; one is a prefix of the other (extra or missing trailing characters)"
+    print(f"  compare:   DIFFERENT ({detail})", file=out)
+    return 1
 
 
 def _connect_sql_auth(args):
@@ -4205,6 +4660,7 @@ def _connect_sql_auth(args):
     driver = {
         "name": "pymssql", "version": getattr(pymssql, "__version__", "?"),
         "paramstyle": "format", "dialect": "mssql",
+        "database": database,
     }
     _warn_old_pymssql(driver["version"])
     _install_pymssql_message_handler(conn)
@@ -4327,6 +4783,7 @@ def _connect_trusted(args):
     driver = {
         "name": "pyodbc", "version": getattr(pyodbc, "version", "?"),
         "paramstyle": "qmark", "dialect": "mssql",
+        "database": database,
     }
     return conn, conn_info, driver
 
@@ -4389,6 +4846,7 @@ def _connect_mysql(args):
     driver = {
         "name": "pymysql", "version": getattr(pymysql, "__version__", "?"),
         "paramstyle": "format", "dialect": "mysql",
+        "database": database,
     }
     return conn, conn_info, driver
 
@@ -4455,6 +4913,8 @@ def _normalize_cli_args(args, parser):
             "--trusted-connection cannot be combined with --user/-U, --password/-W, "
             "or --password-file"
         )
+    if args.check_password and args.trusted_connection:
+        parser.error("--check-password cannot be combined with --trusted-connection (no password is used)")
     if args.mysql and (args.trusted_connection or args.odbc_driver or args.trust_server_certificate):
         parser.error(
             "--mysql cannot be combined with --trusted-connection, --odbc-driver, "
@@ -4551,6 +5011,13 @@ from --fernet-key-file, MSSQL_FERNET_KEY_FILE or MSSQL_FERNET_KEY (MYSQL_* with
         help="Fernet key for a %%%%fernet%%%%-encrypted password (or MSSQL_FERNET_KEY_FILE / "
              "MSSQL_FERNET_KEY; MYSQL_* with --mysql). Requires the cryptography package",
     )
+    conn_grp.add_argument(
+        "--check-password", action="store_true", dest="check_password",
+        help="Diagnose login failures: resolve and decode the password exactly as a connect "
+             "would, report its source, decoding, length, a SHA-256 fingerprint and suspicious "
+             "characters, optionally compare it with one typed at a hidden prompt, then exit "
+             "without connecting. Never prints the password",
+    )
     conn_grp.add_argument("--timeout",        default=30, type=int, metavar="SECS", help="Login timeout in seconds (default: 30)")
     conn_grp.add_argument("--query-timeout",  default=30, type=int, metavar="SECS", help="Query timeout in seconds (default: 30)")
     conn_grp.add_argument(
@@ -4617,6 +5084,9 @@ from --fernet-key-file, MSSQL_FERNET_KEY_FILE or MSSQL_FERNET_KEY (MYSQL_* with
             print(f"Error reading env file: {e}", file=sys.stderr)
             sys.exit(1)
 
+    if args.check_password:
+        sys.exit(check_password(args))
+
     conn = None
     out_file = sys.stdout
     ctx = None
@@ -4641,6 +5111,7 @@ from --fernet-key-file, MSSQL_FERNET_KEY_FILE or MSSQL_FERNET_KEY (MYSQL_* with
             "driver_version":    driver["version"],
             "paramstyle":        driver["paramstyle"],
             "dialect":           driver.get("dialect", "mssql"),
+            "database":          driver.get("database"),
             "mode":              args.mode,
             "insert_table":      (
                 _bracket_table(args.insert_table, driver.get("dialect", "mssql"))

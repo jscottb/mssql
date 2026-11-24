@@ -3100,6 +3100,275 @@ class MssqlRegressionTests(unittest.TestCase):
         self.assertIn("Unknown command '.wat'. Try .help", stderr.getvalue())
         self.assertEqual(ctx["output"].getvalue(), "")
 
+    def _macro_env(self):
+        """Point MACRO_FILE at a temp file for the duration of the test."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / ".mssql_macros"
+        patcher = mock.patch.object(MSSQL, "MACRO_FILE", path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return path
+
+    def _macro_ctx(self, database="CallsDb", **extra):
+        return {"conn": FakeConn(), "output": io.StringIO(), "database": database, **extra}
+
+    def _macro(self, line, ctx=None):
+        ctx = ctx if ctx is not None else self._macro_ctx()
+        with mock.patch("sys.stdout", new=io.StringIO()) as stdout, \
+             mock.patch("sys.stderr", new=io.StringIO()) as stderr:
+            handled = MSSQL.run_dot_command(line, ctx)
+        self.assertTrue(handled)
+        return stdout.getvalue(), stderr.getvalue()
+
+    def test_macro_add_saves_unquoted_text_as_json(self):
+        path = self._macro_env()
+        self._macro(""".macro add getcalls "select * from Calls where call_id='%1' order by call_time desc;" """)
+        self._macro(".macro add sessions select SessionId, RunDate from CallSession;")
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8")),
+            {"callsdb": {
+                "getcalls": "select * from Calls where call_id='%1' order by call_time desc;",
+                "sessions": "select SessionId, RunDate from CallSession;",
+            }},
+        )
+
+    def test_macro_add_keeps_text_that_is_not_one_quoted_argument(self):
+        path = self._macro_env()
+        self._macro(".macro add lit 'a' + '%1'")
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"callsdb": {"lit": "'a' + '%1'"}})
+
+    def test_macro_add_refuses_existing_name_and_edit_replaces(self):
+        path = self._macro_env()
+        self._macro('.macro add callwork "select * from W order by ModifyDate"')
+        _, err = self._macro('.macro add callwork "select 1"')
+        self.assertIn("already exists", err)
+        self._macro('.macro edit callwork "select ContactId from W"')
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")),
+                         {"callsdb": {"callwork": "select ContactId from W"}})
+
+    def test_macro_edit_and_delete_require_existing_macro(self):
+        path = self._macro_env()
+        _, err = self._macro('.macro edit nope "select 1"')
+        self.assertIn("No macro named 'nope'", err)
+        _, err = self._macro(".macro delete nope")
+        self.assertIn("No macro named 'nope'", err)
+        self.assertFalse(path.exists())
+
+    def test_macro_delete_removes_macro(self):
+        path = self._macro_env()
+        self._macro('.macro add a "select 1"')
+        self._macro('.macro add b "select 2"')
+        _, err = self._macro(".macro delete a")
+        self.assertIn("Macro 'a' deleted.", err)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")),
+                         {"callsdb": {"b": "select 2"}})
+
+    def test_macro_rejects_invalid_name_and_missing_text(self):
+        path = self._macro_env()
+        _, err = self._macro('.macro add "bad name" "select 1"')
+        self.assertIn("Invalid macro name", err)
+        _, err = self._macro(".macro add good")
+        self.assertIn("Usage: .macro add NAME", err)
+        self.assertFalse(path.exists())
+
+    def test_macro_list_shows_name_and_first_60_chars(self):
+        self._macro_env()
+        long_sql = "select " + ", ".join(f"col{i}" for i in range(30)) + " from t"
+        self._macro(f'.macro add zlong "{long_sql}"')
+        self._macro('.macro add a "select\n  1"'.replace("\n", " "))
+        out, _ = self._macro(".macro list")
+        lines = out.splitlines()
+        self.assertEqual(lines[0], "a      select 1")
+        self.assertEqual(lines[1], "zlong  " + long_sql[:60] + "...")
+
+    def test_macro_list_when_empty_goes_to_stderr(self):
+        self._macro_env()
+        out, err = self._macro(".macro list")
+        self.assertEqual(out, "")
+        self.assertIn("No macros defined", err)
+
+    def test_macro_refuses_to_overwrite_malformed_file(self):
+        path = self._macro_env()
+        path.write_text("{not json", encoding="utf-8")
+        _, err = self._macro('.macro add a "select 1"')
+        self.assertIn("not valid JSON", err)
+        self.assertEqual(path.read_text(encoding="utf-8"), "{not json")
+
+    def test_macro_exec_substitutes_args_in_order(self):
+        self._macro_env()
+        self._macro(""".macro add getcalls "select * from Calls where call_time='%1' and id=%2 and x='%1';" """)
+        ctx = self._macro_ctx()
+        with mock.patch.object(MSSQL, "execute_sql", return_value=True) as execute_sql:
+            self._macro(".macro exec getcalls '2026-11-15' 42", ctx)
+        execute_sql.assert_called_once_with(
+            "select * from Calls where call_time='2026-11-15' and id=42 and x='2026-11-15';", ctx
+        )
+
+    def test_macro_exec_handles_double_digit_params_and_percent_escape(self):
+        self._macro_env()
+        params = " ".join(f"%{i}" for i in range(1, 11))
+        self._macro(f".macro add many \"select '{params}' where n like '%%x%%'\"")
+        ctx = self._macro_ctx()
+        with mock.patch.object(MSSQL, "execute_sql", return_value=True) as execute_sql:
+            self._macro(".macro exec many a b c d e f g h i j", ctx)
+        execute_sql.assert_called_once_with(
+            "select 'a b c d e f g h i j' where n like '%x%'", ctx
+        )
+
+    def test_macro_exec_args_are_not_re_expanded(self):
+        self._macro_env()
+        self._macro(".macro add m select '%1', '%2'")
+        ctx = self._macro_ctx()
+        with mock.patch.object(MSSQL, "execute_sql", return_value=True) as execute_sql:
+            self._macro(".macro exec m %2 b", ctx)
+        execute_sql.assert_called_once_with("select '%2', 'b'", ctx)
+
+    def test_macro_exec_missing_argument_does_not_run(self):
+        self._macro_env()
+        self._macro(".macro add m select '%1', '%3'")
+        ctx = self._macro_ctx()
+        with mock.patch.object(MSSQL, "execute_sql") as execute_sql:
+            _, err = self._macro(".macro exec m only", ctx)
+        execute_sql.assert_not_called()
+        self.assertIn("missing argument(s) for %3", err)
+
+    def test_macro_exec_warns_about_extra_arguments(self):
+        self._macro_env()
+        self._macro(".macro add m select 1")
+        ctx = self._macro_ctx()
+        with mock.patch.object(MSSQL, "execute_sql", return_value=True) as execute_sql:
+            _, err = self._macro(".macro exec m extra", ctx)
+        execute_sql.assert_called_once_with("select 1", ctx)
+        self.assertIn("ignored 1 extra argument(s)", err)
+
+    def test_macro_exec_splits_on_go(self):
+        path = self._macro_env()
+        path.write_text(json.dumps({"callsdb": {"two": "select 1\nGO\nselect 2"}}), encoding="utf-8")
+        ctx = self._macro_ctx()
+        with mock.patch.object(MSSQL, "execute_sql", return_value=True) as execute_sql:
+            self._macro(".macro exec two", ctx)
+        self.assertEqual([c.args[0].strip() for c in execute_sql.call_args_list],
+                         ["select 1", "select 2"])
+
+    def test_macro_exec_unknown_name(self):
+        self._macro_env()
+        _, err = self._macro(".macro exec nope")
+        self.assertIn("No macro named 'nope'", err)
+
+    def test_macro_unknown_subcommand_shows_usage(self):
+        self._macro_env()
+        _, err = self._macro(".macro frob x")
+        self.assertIn("Unknown .macro subcommand 'frob'", err)
+        self.assertIn("Usage: .macro add", err)
+
+    def test_macro_use_prefills_next_repl_line(self):
+        self._macro_env()
+        self._macro(""".macro add getcalls "select * from Calls where id='%1';" """)
+        ctx = self._macro_ctx()
+        inputs = iter([".macro use getcalls 7", "select * from Calls where id='7';", EOFError()])
+        prefills = []
+
+        def fake_input(prompt):
+            value = next(inputs)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def fake_prefill(prompt, text):
+            prefills.append(text)
+            return fake_input(prompt)
+
+        with mock.patch("builtins.input", side_effect=fake_input), \
+             mock.patch.object(MSSQL, "_prefill_supported", return_value=True), \
+             mock.patch.object(MSSQL, "_input_with_prefill", side_effect=fake_prefill), \
+             mock.patch.object(MSSQL, "execute_sql", return_value=True) as execute_sql, \
+             mock.patch("sys.stderr", new=io.StringIO()):
+            MSSQL.interactive_loop(ctx)
+
+        self.assertEqual(prefills, ["select * from Calls where id='7';"])
+        execute_sql.assert_called_once_with("select * from Calls where id='7';", ctx)
+
+    def test_macro_use_without_args_keeps_placeholders(self):
+        self._macro_env()
+        self._macro(".macro add m select '%1'")
+        ctx = self._macro_ctx(interactive=True)
+        with mock.patch.object(MSSQL, "_prefill_supported", return_value=True):
+            self._macro(".macro use m", ctx)
+        self.assertEqual(ctx["pending_input"], "select '%1'")
+
+    def test_macro_use_falls_back_to_printing_text(self):
+        self._macro_env()
+        self._macro(".macro add m select 1")
+        ctx = self._macro_ctx(interactive=True)
+        with mock.patch.object(MSSQL, "_prefill_supported", return_value=False):
+            _, err = self._macro(".macro use m", ctx)
+        self.assertNotIn("pending_input", ctx)
+        self.assertIn("select 1", err)
+
+    def test_macro_keyed_by_database_and_isolated_between_databases(self):
+        path = self._macro_env()
+        self._macro('.macro add q "select 1"', self._macro_ctx("CallsDb"))
+        self._macro('.macro add q "select 2"', self._macro_ctx("reporting"))
+        self.assertEqual(
+            json.loads(path.read_text(encoding="utf-8")),
+            {"callsdb": {"q": "select 1"}, "reporting": {"q": "select 2"}},
+        )
+        out, err = self._macro(".macro list", self._macro_ctx("REPORTING"))
+        self.assertEqual(out, "q  select 2\n")
+        self.assertIn("Macros for database 'reporting'", err)
+        _, err = self._macro(".macro exec q", self._macro_ctx("other"))
+        self.assertIn("No macro named 'q' for database 'other'", err)
+
+    def test_macro_without_database_uses_default_key(self):
+        path = self._macro_env()
+        self._macro('.macro add q "select 1"', self._macro_ctx(None))
+        self._macro('.macro add r "select 2"', self._macro_ctx(""))
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")),
+                         {"(default)": {"q": "select 1", "r": "select 2"}})
+
+    def test_macro_delete_last_macro_drops_database_entry(self):
+        path = self._macro_env()
+        self._macro('.macro add a "select 1"', self._macro_ctx("one"))
+        self._macro('.macro add b "select 2"', self._macro_ctx("two"))
+        self._macro(".macro delete a", self._macro_ctx("one"))
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"two": {"b": "select 2"}})
+
+    def test_macro_rejects_malformed_file_layout(self):
+        path = self._macro_env()
+        for bad in ({"db1": {"a": "select 1"}, "db2": ["nope"]}, {"flat": "select 1"}, ["x"]):
+            path.write_text(json.dumps(bad), encoding="utf-8")
+            _, err = self._macro('.macro add b "select 2"')
+            self.assertIn("must be a JSON object mapping database names", err)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), bad)
+
+    def test_reconnect_updates_macro_database(self):
+        ctx = self._macro_ctx("old", conn_args=object())
+        new_driver = {"name": "pymssql", "version": "x", "paramstyle": "format",
+                      "dialect": "mssql", "database": "newdb"}
+        with mock.patch.object(MSSQL, "_connect", return_value=(FakeConn(), "u@h:1433/newdb", new_driver)), \
+             mock.patch("sys.stderr", new=io.StringIO()):
+            MSSQL.run_dot_command(".reconnect", ctx)
+        self.assertEqual(ctx["database"], "newdb")
+
+    def test_input_with_prefill_inserts_text_and_clears_hook(self):
+        fake_rl = types.SimpleNamespace(
+            inserted=[], hooks=[],
+            insert_text=lambda t: fake_rl.inserted.append(t),
+            redisplay=lambda: None,
+        )
+        fake_rl.set_pre_input_hook = lambda h: fake_rl.hooks.append(h)
+
+        def fake_input(prompt):
+            fake_rl.hooks[-1]()
+            return "edited"
+
+        with mock.patch.object(MSSQL, "readline", fake_rl), \
+             mock.patch("builtins.input", side_effect=fake_input):
+            self.assertEqual(MSSQL._input_with_prefill("mssql> ", "select 1"), "edited")
+        self.assertEqual(fake_rl.inserted, ["select 1"])
+        self.assertIsNone(fake_rl.hooks[-1])
+
     def test_format_insert_escapes_closing_bracket_in_column_names(self):
         sql = MSSQL.format_insert([(1,)], ["weird]name"], "[dbo].[t]")
         self.assertIn("[weird]]name]", sql)
@@ -3126,6 +3395,37 @@ class MssqlRegressionTests(unittest.TestCase):
         register.assert_called_once()
         write_cb = register.call_args.args[0]
         write_cb()
+
+    def test_setup_readline_completes_macro_subcommands_and_names(self):
+        self._macro_env()
+        self._macro('.macro add getcalls "select 1"')
+        self._macro('.macro add getsessions "select 2"')
+        line = [""]
+        fake_readline = types.SimpleNamespace(
+            __doc__="",
+            set_completer=mock.Mock(),
+            parse_and_bind=mock.Mock(),
+            get_line_buffer=lambda: line[0],
+            get_begidx=lambda: len(line[0]) - len(line[0].split(" ")[-1]),
+        )
+        with mock.patch.object(MSSQL, "readline", fake_readline):
+            MSSQL.setup_readline(self._macro_ctx())
+        completer = fake_readline.set_completer.call_args.args[0]
+
+        def complete(buf):
+            line[0] = buf
+            text = buf.split(" ")[-1]
+            out, state = [], 0
+            while (m := completer(text, state)) is not None:
+                out.append(m)
+                state += 1
+            return out
+
+        self.assertIn(".macro", complete(".ma"))
+        self.assertEqual(complete(".macro e"), ["edit", "exec"])
+        self.assertEqual(complete(".macro exec get"), ["getcalls", "getsessions"])
+        self.assertEqual(complete(".macro add get"), [])
+        self.assertIn("SELECT", complete("SEL"))
 
     def test_load_readline_falls_back_to_pyreadline3(self):
         fallback = object()
@@ -3207,7 +3507,8 @@ class MssqlRegressionTests(unittest.TestCase):
         self.assertEqual(conn_info, "(trusted)@db.example:1433/app")
         self.assertEqual(
             driver,
-            {"name": "pyodbc", "version": "test-pyodbc", "paramstyle": "qmark", "dialect": "mssql"},
+            {"name": "pyodbc", "version": "test-pyodbc", "paramstyle": "qmark", "dialect": "mssql",
+             "database": "app"},
         )
 
     def test_connect_trusted_odbc_driver_precedence(self):
@@ -3851,6 +4152,15 @@ class MssqlRegressionTests(unittest.TestCase):
         ctx_arg = interactive_loop.call_args[0][0]
         self.assertIsInstance(ctx_arg["conn_args"], object)
         self.assertEqual(ctx_arg["conn_args"].user, "sa")
+
+    def test_main_records_connected_database_for_macros(self):
+        driver = {**FAKE_DRIVER, "database": "CallsDb"}
+        with mock.patch.object(MSSQL, "build_connection", return_value=(FakeConn(), "test", driver)), \
+             mock.patch.object(MSSQL, "interactive_loop") as interactive_loop, \
+             mock.patch("sys.argv", ["mssql.py", "-U", "sa"]), \
+             mock.patch("sys.stdin.isatty", return_value=True):
+            MSSQL.main()
+        self.assertEqual(MSSQL._macro_database_key(interactive_loop.call_args[0][0]), "callsdb")
 
     # ── read_json_data / read_csv_data streaming docs ──────────────────────
 
@@ -4674,7 +4984,8 @@ class MssqlRegressionTests(unittest.TestCase):
         self.assertEqual(conn_info, "app@my.example:3306/appdb")
         self.assertEqual(
             driver,
-            {"name": "pymysql", "version": "test-pymysql", "paramstyle": "format", "dialect": "mysql"},
+            {"name": "pymysql", "version": "test-pymysql", "paramstyle": "format", "dialect": "mysql",
+             "database": "appdb"},
         )
 
     def test_connect_mysql_does_not_fall_back_to_mssql_env_vars(self):
@@ -5975,6 +6286,105 @@ class MssqlRegressionTests(unittest.TestCase):
                         MSSQL._connect(args)
                     self.assertIn(reason, str(exc.exception))
                     self.assertNotIn("s3cret", str(exc.exception))
+
+    # ── --check-password ──────────────────────────────────────────────────
+
+    def _check_password(self, args, typed=None, env=None):
+        stdin = mock.Mock(isatty=mock.Mock(return_value=typed is not None))
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}, clear=True), \
+             mock.patch.object(MSSQL.pymssql, "connect") as mssql_connect, \
+             mock.patch.object(MSSQL.pymysql, "connect") as mysql_connect, \
+             mock.patch("sys.stderr", err):
+            code = MSSQL.check_password(args, stdin=stdin, prompt=lambda _: typed)
+        mssql_connect.assert_not_called()
+        mysql_connect.assert_not_called()
+        return code, err.getvalue()
+
+    def test_check_password_reports_source_decoding_and_fingerprint_without_revealing_it(self):
+        import hashlib
+        encoded = "%%b64%%" + base64.b64encode(b"s3cret\n").decode()
+        for mysql, prefix in ((False, "MSSQL"), (True, "MYSQL")):
+            for source, args_kw, env, label in (
+                ("flag", {"password": "s3cret"}, {}, "-W/--password"),
+                ("env_file", {"env_file": "app.env", "env_file_values": {f"{prefix}_PASSWORD": encoded}},
+                 {}, "--env-file 'app.env'"),
+                ("environment", {}, {f"{prefix}_PASSWORD": encoded}, f"environment variable {prefix}_PASSWORD"),
+            ):
+                with self.subTest(mysql=mysql, source=source):
+                    args = self._mysql_args(user="app", mysql=mysql, **args_kw)
+                    code, out = self._check_password(args, env=env)
+                    self.assertEqual(code, 0)
+                    self.assertIn(label, out)
+                    self.assertIn("6 characters, 6 UTF-8 bytes", out)
+                    self.assertIn(hashlib.sha256(b"s3cret").hexdigest()[:16], out)
+                    self.assertIn("base64-decoded" if source != "flag" else "plain text", out)
+                    self.assertNotIn("s3cret", out)
+                    self.assertNotIn("warning", out)
+
+    def test_check_password_flags_characters_that_break_logins(self):
+        for password, user, expected in (
+            ("pw\r", "app", "U+000D"),
+            (" pw", "app", "leading or trailing whitespace"),
+            ("p\u00a0w", "app", "non-breaking/zero-width space"),
+            ("pw", "DOM\\me", "DOMAIN\\user"),
+            ("pw", "", "no user set"),
+            ("", "app", "password is empty"),
+        ):
+            with self.subTest(password=password, user=user):
+                code, out = self._check_password(self._mysql_args(user=user, mysql=False, password=password))
+                self.assertEqual(code, 0)
+                self.assertIn(expected, out)
+
+    def test_check_password_compares_with_typed_password(self):
+        args = self._mysql_args(user="app", mysql=False, password="%%b64%%" + base64.b64encode(b"s3cret\r\n\n").decode())
+        for typed, code_expected, text in (
+            ("s3cret\r\n", 0, "MATCH"),
+            ("s3cret", 1, "one is a prefix of the other"),
+            ("s3cRet\r\n", 1, "first difference at character 4"),
+            ("", 0, None),
+        ):
+            with self.subTest(typed=typed):
+                code, out = self._check_password(args, typed=typed)
+                self.assertEqual(code, code_expected)
+                if text:
+                    self.assertIn(text, out)
+                else:
+                    self.assertNotIn("  compare:", out)
+
+    @unittest.skipUnless(importlib.util.find_spec("cryptography"), "optional cryptography dependency")
+    def test_check_password_fernet_names_key_source_and_reports_failures(self):
+        key, fernet = self._fernet()
+        token = "%%fernet%%" + fernet.encrypt(b"s3cret").decode()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = self._key_file(tmpdir, key)
+            code, out = self._check_password(self._mysql_args(
+                user="app", mysql=False, password=token, fernet_key_file=key_path))
+            self.assertEqual(code, 0)
+            self.assertIn(f"decrypted with key from --fernet-key-file '{key_path}'", out)
+            wrong = self._key_file(tmpdir, self._fernet()[0], name="wrong.key")
+            code, out = self._check_password(self._mysql_args(
+                user="app", mysql=False, password=token, fernet_key_file=wrong))
+            self.assertEqual(code, 1)
+            self.assertIn("Password check failed", out)
+            self.assertNotIn("s3cret", out)
+            self.assertNotIn(key.decode(), out)
+
+    def test_main_check_password_exits_without_connecting_and_rejects_trusted(self):
+        with mock.patch.object(sys, "argv", ["mssql.py", "-U", "app", "-W", "pw", "--check-password"]), \
+             mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(MSSQL, "build_connection") as build, \
+             mock.patch("sys.stderr", io.StringIO()), \
+             mock.patch("sys.stdin", mock.Mock(isatty=mock.Mock(return_value=False))), \
+             self.assertRaises(SystemExit) as exc:
+            MSSQL.main()
+        self.assertEqual(exc.exception.code, 0)
+        build.assert_not_called()
+        with mock.patch.object(sys, "argv", ["mssql.py", "-E", "--check-password"]), \
+             mock.patch("sys.stderr", io.StringIO()) as err, self.assertRaises(SystemExit) as exc:
+            MSSQL.main()
+        self.assertEqual(exc.exception.code, 2)
+        self.assertIn("--check-password cannot be combined with --trusted-connection", err.getvalue())
 
     @unittest.skipUnless(os.path.isdir("/dev/fd"), "needs /dev/fd (process substitution paths)")
     def test_password_file_from_pipe_survives_reconnect(self):

@@ -136,6 +136,32 @@ $ python3 mssql.py --env-file app.env --password-file <(pass show db/app) --fern
 
 A pipe like this can be read only once, so the tool keeps what it read and reuses it for `.reconnect` (and, with `--mysql`, for the side connection that cancels a timed-out query). A regular file is read again on each reconnect, so a password changed on disk takes effect at the next `.reconnect`.
 
+### Checking a password
+
+When a login fails, `--check-password` shows what the tool would actually send, without connecting and without printing the password. It resolves and decodes the password exactly as a real connect does (same sources, same precedence, same `%%b64%%`/`%%fernet%%` handling), then reports:
+
+- where the password came from (`-W`, `--password-file`, the env file, or the environment) and how it was decoded (for `%%fernet%%`, where the key came from)
+- its length in characters and UTF-8 bytes, and the first 16 hex digits of its SHA-256
+- warnings for things that commonly break logins: leading or trailing spaces, control characters such as a stray carriage return, non-breaking or zero-width spaces from copy-paste, non-ASCII characters, an empty password, no user, or a `DOMAIN\user` login (which pymssql sends as NTLM rather than as a SQL login)
+
+On a terminal it then asks for the expected password at a hidden prompt (press Enter to skip) and says whether the two match. If they differ, it says how (different lengths, extra trailing characters, or the position of the first difference).
+
+```bash
+$ python3 mssql.py --env-file app.env --check-password
+Password check (no connection is made):
+  backend:   SQL Server (pymssql)
+  server:    myserver:1433   database: mydb
+  user:      'app'
+  source:    --env-file 'app.env' (MSSQL_PASSWORD or DB_PASSWORD)
+  encoding:  %%b64%% (base64-decoded)
+  length:    9 characters, 9 UTF-8 bytes
+  sha256:    6b2f0c1e9d3a4b57…  (compare: printf '%s' 'EXPECTED' | sha256sum)
+  warning:   control character(s) U+000D (e.g. a carriage return from a Windows-edited file)
+Type the expected password to compare (Enter to skip):
+```
+
+If the passwords match and the login still fails, decoding is not the problem. Look at the user, the database (a database you cannot open also gives "Login failed"), or the server's authentication mode instead. The SQL Server error log records the reason for each failed login. The exit code is 0 when the password resolves (and matches, if you typed one), and 1 when it fails to decode or does not match. `--check-password` cannot be combined with `-E`.
+
 ### Timeouts
 
 `--timeout` sets the login/connect timeout and `--query-timeout` the per-query timeout; both default to 30 seconds and must be greater than 0.
@@ -216,7 +242,7 @@ mysql> SELECT id, name
 | Ctrl-C at the prompt | Discards the statement being typed |
 | Ctrl-C while a query runs | Prints "Interrupted." and returns to the prompt. Re-reads transaction state when the connection survives; if MySQL closes it, attempts cancellation and asks you to `.reconnect` |
 | Ctrl-D (EOF) | Exits, same as `.quit` or `.exit` |
-| Tab | Completes SQL keywords (upper or lower case) and dot commands |
+| Tab | Completes SQL keywords (upper or lower case) and dot commands; after `.macro`, completes subcommands and macro names |
 
 ### History
 
@@ -287,6 +313,7 @@ Dot commands work only at the interactive prompt, at the start of a new statemen
 | `.headers on\|off` | Shows or hides header rows |
 | `.output FILE [--append] [--insert TABLE]` | Sends results to FILE; `.output -` returns to stdout |
 | `.read FILE` | Runs a SQL script, split on `GO` like `-f` |
+| `.macro add\|edit\|delete\|list\|use\|exec ...` | Saves, lists and runs SQL macros with `%1`, `%2`, ... parameters (see [Macros](#macros)) |
 | `.reconnect` | Reconnects with the original settings and resets transaction tracking |
 | `.timer on\|off` | Shows or hides elapsed time per statement |
 | `.rowcount on\|off` | Shows or hides row counts |
@@ -307,6 +334,51 @@ Reopening the same file flushes the previous writer before overwriting or append
 ### .reconnect
 
 Use `.reconnect` after a dropped connection or a query timeout. It opens a new connection before closing the old one, so if reconnecting fails you keep the old session. Any transaction open on the old connection is lost.
+
+### Macros
+
+A macro is a saved piece of SQL with optional parameters `%1`, `%2`, ... . Macros belong to the database you connected to: each database has its own set, so `.macro list` shows only the current database's macros and the same name can hold different SQL in different databases. The database is the name given with `DBNAME`, `-d`, `MSSQL_DATABASE`/`MYSQL_DATABASE` or the env file, compared without regard to case. The server doesn't matter, so a database with the same name on two servers shares one set of macros. Switching databases with `USE` doesn't change which macros you see. Macros saved without a database name are kept under `(default)`.
+
+Macros are stored as JSON in `~/.mssql_macros`, grouped by database:
+
+```json
+{
+  "callsdb": {
+    "getcalls": "select * from Calls where call_id='%1' order by call_time desc;"
+  },
+  "reporting": {
+    "sessions": "select SessionId, RunDate from CallSession order by RunDate desc;"
+  }
+}
+```
+
+```text
+mssql> .macro add getcalls "select * from Calls where call_id='%1' order by call_time desc;"
+mssql> .macro add sessions "select SessionId, RunDate from CallSession order by RunDate desc;"
+mssql> .macro list
+getcalls  select * from Calls where call_id='%1' order by call_time desc;
+sessions  select SessionId, RunDate from CallSession order by RunDate desc;
+mssql> .macro exec getcalls 'A-1001'
+mssql> .macro use getcalls 'A-1001'
+mssql> select * from Calls where call_id='A-1001' order by call_time desc;
+```
+
+| Subcommand | What it does |
+| --- | --- |
+| `add NAME "SQL"` | Saves a new macro. Refuses a name that already exists |
+| `edit NAME "SQL"` | Replaces the text of an existing macro |
+| `delete NAME` | Deletes a macro |
+| `list` | Shows each name and the first 60 characters of its text |
+| `use NAME [ARGS...]` | Puts the macro on the next input line so you can edit it before pressing Enter. With ARGS, the parameters are filled in first; without, `%1` etc. are left in place |
+| `exec NAME [ARGS...]` | Runs the macro, split on `GO` like `.read` |
+
+- **Names** use letters, digits, `_`, `.` and `-`.
+- **Text**: wrap the SQL in double quotes (single quotes inside are kept). Unquoted text after the name is also taken as-is.
+- **Arguments** are split like a shell command line, so `'2026-11-15'` or `"two words"` is one argument and its outer quotes are removed. The first argument replaces every `%1`, the second every `%2`, and so on (`%10` and up work too).
+- **Substitution is plain text**: put quotes around the placeholder in the macro (`call_id='%1'`) when the value is a string. A value containing `'` is not escaped.
+- **Literal percent**: write `%%` for a `%` that must not be read as a parameter, for example `LIKE '%%1%%'`. Other `%` characters (`LIKE 'abc%'`) need no escaping.
+- `exec` refuses to run if the macro uses a parameter with no matching argument, and warns about extra arguments.
+- `use` needs `readline`. Without it, or for a multi-line macro, it prints the macro text to stderr instead.
 
 ## Exporting data
 
@@ -449,6 +521,7 @@ python3 mssql.py [OPTIONS] [DATABASE] [SQL_FILE]
 | `--env-file FILE` | None | Reads connection settings from a dotenv file |
 | `--password-file FILE` | None | Reads the password (plain, `%%b64%%` or `%%fernet%%`) from a file |
 | `--fernet-key-file FILE` | None | Key for a `%%fernet%%`-encrypted password |
+| `--check-password` | Off | Reports how the password resolves (source, decoding, length, fingerprint, warnings), then exits without connecting |
 | `--timeout SECS` | 30 | Login/connect timeout |
 | `--query-timeout SECS` | 30 | Per-query timeout |
 | `--mysql` | Off | Connects to MySQL with pymysql |
